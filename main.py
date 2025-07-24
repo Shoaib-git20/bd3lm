@@ -85,13 +85,17 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 
 def generate_samples(config, logger, tokenizer):
   logger.info('Generating samples.')
+  print("Before sampling: ", torch.cuda.memory_allocated() / 1e6, "MB")
   model = _load_from_checkpoint(config=config,
                                 tokenizer=tokenizer)
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
+  print('Model loaded from checkpoint')
+  
   text_samples = model.restore_model_and_sample(
     num_steps=config.algo.T)
+
   print('Text samples:', text_samples)
   print('Generative perplexity:',
         model.metrics.gen_ppl.compute())

@@ -17,6 +17,8 @@ import noise_schedule
 import utils
 import numpy as np
 import itertools
+from torch.profiler import profile, record_function, ProfilerActivity
+
 
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
@@ -557,45 +559,53 @@ class Diffusion(L.LightningModule):
 
   @torch.no_grad()
   def _ddpm_caching_update(self, x, t, dt, p_x0=None):
-    _, move_chance_t = self.noise(t)
-    _, move_chance_s = self.noise(t - dt)
-    sigma_t = self._sigma_from_p(move_chance_t)
-    move_chance_t = move_chance_t[:, None]
-    move_chance_s = move_chance_s[:, None]
-    mask_prob = move_chance_s / move_chance_t
+    with record_function("ddpm_cache:noise_and_sigma_calc"):
+      _, move_chance_t = self.noise(t)
+      _, move_chance_s = self.noise(t - dt)
+      sigma_t = self._sigma_from_p(move_chance_t)
+      move_chance_t = move_chance_t[:, None]
+      move_chance_s = move_chance_s[:, None]
+      mask_prob = move_chance_s / move_chance_t
 
     if p_x0 is None:
-      if self.config.sampling.kv_cache:
-        p_x0 = self.forward(x[:, -self.block_size:],
-                        sigma_t,
-                        sample_mode=True).to(torch.float64)
-      else:   
-        p_x0 = self.forward(x,
-                          sigma_t,
-                          sample_mode=True).to(torch.float64)
-        p_x0 = p_x0[:, -self.block_size:]
-      p_x0 = p_x0.exp()
-      p_x0 = self._nucleus_sample(p_x0)
+      with record_function("ddpm_cache:forward_sample_p_x0"):
+        if self.config.sampling.kv_cache:
+          p_x0 = self.forward(x[:, -self.block_size:],
+                              sigma_t,
+                              sample_mode=True).to(torch.float64)
+        else:   
+          p_x0 = self.forward(x,
+                              sigma_t,
+                              sample_mode=True).to(torch.float64)
+          p_x0 = p_x0[:, -self.block_size:]
+      with record_function("ddpm_cache:sample_nucleus"):
+        p_x0 = p_x0.exp()
+        p_x0 = self._nucleus_sample(p_x0)
 
     if self.config.sampling.first_hitting:
-      x_block = _sample_categorical(p_x0)
-      # randomly and uniformly select an index in the block (among masked tokens)
-      num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
-      ind = torch.randint(0, num_masked, (x_block.shape[0],))
-      ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
-      mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
-      x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
+      with record_function("ddpm_cache:first_hitting_sample"):
+        x_block = _sample_categorical(p_x0)
+        # randomly and uniformly select an index in the block (among masked tokens)
+        num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
+        ind = torch.randint(0, num_masked, (x_block.shape[0],))
+        ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
+        mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
+        x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
     else:
-      q_xs = p_x0 * (1 - mask_prob)
-      q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
-      x_block = _sample_categorical(q_xs)
-    copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
-    x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
-    x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
+      with record_function("ddpm_cache:non_first_hitting_sample"):
+        q_xs = p_x0 * (1 - mask_prob)
+        q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
+        x_block = _sample_categorical(q_xs)
+
+    with record_function("ddpm_cache:merge_block"):
+      copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
+      x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
+      x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
 
     # compute kv cache if all tokens in a block are sampled
     if self.config.sampling.kv_cache and self.mask_index not in x_block:
-      _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
+      with record_function("ddpm_cache:store_kv_cache"):
+        _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
 
     if not torch.allclose(x_new, x):
       return None, x_new
@@ -670,13 +680,14 @@ class Diffusion(L.LightningModule):
         sample_i, num_tries = None, 0
         while sample_i is None:
           num_tries += 1
-          sample_i, nfes = self._semi_ar_sampler(
-            n_samples=batch_size_per_gpu,
-            num_strides=(seqlen // self.block_size), 
-            num_steps=num_steps,
-            seqlen=seqlen)
-          if num_tries > 10:
-            raise ValueError('Sampling failed.')
+          with record_function("semi_ar_sampler"):
+            sample_i, nfes = self._semi_ar_sampler(
+              n_samples=batch_size_per_gpu,
+              num_strides=(seqlen // self.block_size), 
+              num_steps=num_steps,
+              seqlen=seqlen)
+            if num_tries > 10:
+              raise ValueError('Sampling failed.')
         samples.append(sample_i)
         self.metrics.nfes.update(nfes)
         self.metrics.gen_nfes.append(nfes)
@@ -709,11 +720,40 @@ class Diffusion(L.LightningModule):
       self.ema.copy_to(self._get_parameters())
     self.backbone.eval()
     self.noise.eval()
-    samples = self._sample(
-      seqlen=seqlen,
-      batch_size_per_gpu=self.config.loader.eval_batch_size,
-      num_steps=num_steps,
-      eps=eps)
+    print('Sampling from the model...')
+    print("Starting PyTorch Profiler...")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir_bd3lm'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=True,
+    ) as prof:
+        for _ in range(3):
+            prof.step()
+            with torch.no_grad():
+                with record_function("BD3LM_sample"):
+                    samples = self._sample(
+                        seqlen=seqlen,
+                        batch_size_per_gpu=self.config.loader.eval_batch_size,
+                        num_steps=num_steps,
+                        eps=eps
+                    )
+            
+    print("Profiler run complete. Printing summary...")
+    print("-" * 50)
+
+    print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=15))
+
+    print("\n" + "-" * 50)
+    print("To view the detailed trace, run the following command in your terminal:")
+    print("tensorboard --logdir=./log")
+    print("-" * 50)
+
+
     self.metrics.record_generative_perplexity(
       samples,
       self.config.model.length,
@@ -997,15 +1037,16 @@ class Diffusion(L.LightningModule):
 
     for stride_num in tqdm(range(num_strides)):
       # sample next block
-      if stride_num == 0:
-        x_accum = self._sample_prior(n_samples, self.block_size).to(self.device)
-        x_accum[:, 0] = self.tokenizer.bos_token_id
-      else:
-        if mdlm_semi_ar:
-          x = self._sample_prior(n_samples, 512).to(self.device)
+      with record_function(f"sampler:stride_{stride_num}"):
+        if stride_num == 0:
+          x_accum = self._sample_prior(n_samples, self.block_size).to(self.device)
+          x_accum[:, 0] = self.tokenizer.bos_token_id
         else:
-          x = self._sample_prior(n_samples, self.block_size).to(self.device)
-        x_accum = torch.cat((x_accum, x), dim=1)
+          if mdlm_semi_ar:
+            x = self._sample_prior(n_samples, 512).to(self.device)
+          else:
+            x = self._sample_prior(n_samples, self.block_size).to(self.device)
+          x_accum = torch.cat((x_accum, x), dim=1)
 
       # compute logits in a sliding window (context passed to model can't exceed context_size)
       end_idx = (stride_num + 1) * self.block_size
@@ -1019,27 +1060,30 @@ class Diffusion(L.LightningModule):
       timesteps = torch.linspace(1, 0, num_steps, device=self.device)
       t = 1
       for i in range(num_steps):
-        if self.mask_index not in x_accum:
-          break
+        with record_function(f"sampler:diffusion_step_{i}"):
+          if self.mask_index not in x_accum:
+            break
 
-        # faster (equivalent) sampler from zheng et al (2025)
-        if self.config.sampling.first_hitting:
-          u = np.random.rand()
-          num_masked = (x_accum[:, fwd_idx] == self.mask_index).sum(-1).item()
-          t *= u**(1 / num_masked)
-              
-        elif not self.config.sampling.first_hitting:
-          t = timesteps[i]
+          # faster (equivalent) sampler from zheng et al (2025)
+          with record_function("sampler:update_time"):
+            if self.config.sampling.first_hitting:
+              u = np.random.rand()
+              num_masked = (x_accum[:, fwd_idx] == self.mask_index).sum(-1).item()
+              t *= u**(1 / num_masked)
 
-        p_x0_cache, x_next = self._ddpm_caching_update(
-            x=x_accum[:, fwd_idx],
-            t=t * ones,
-            dt=dt,
-            p_x0=p_x0_cache,)
-        if p_x0_cache is None:
-          sampling_steps += 1
-       
-        x_accum[:, fwd_idx] = x_next
+            elif not self.config.sampling.first_hitting:
+              t = timesteps[i]
+
+          with record_function("sampler:_ddpm_caching_update"):
+            p_x0_cache, x_next = self._ddpm_caching_update(
+                x=x_accum[:, fwd_idx],
+                t=t * ones,
+                dt=dt,
+                p_x0=p_x0_cache,)
+            if p_x0_cache is None:
+              sampling_steps += 1
+
+          x_accum[:, fwd_idx] = x_next
 
       # check if we need to resample (or stop sampling for variable-length sampling)
       if x_accum.shape[1] > 256:
