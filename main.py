@@ -11,6 +11,10 @@ import transformers
 import dataloader
 import diffusion
 import utils
+from torch.profiler import profile, record_function, ProfilerActivity
+from lightning.pytorch.loggers import TensorBoardLogger
+
+torch.backends.cudnn.benchmark = False
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -195,6 +199,7 @@ def _train(config, logger, tokenizer):
       config.training.sampling_eps_max))
   else:
     logger.info(f'Initializing new model')
+    config.wandb = None
     model = diffusion.Diffusion(
       config, tokenizer=valid_ds.tokenizer)
   trainer = hydra.utils.instantiate(
@@ -202,9 +207,34 @@ def _train(config, logger, tokenizer):
     default_root_dir=os.getcwd(),
     callbacks=callbacks,
     strategy=hydra.utils.instantiate(config.strategy),
-    logger=wandb_logger)
-
+    logger=[wandb_logger, TensorBoardLogger(save_dir='log_dir', name='tensorboard')] 
+    #logger=wandb_logger
+    )
+  print('Model initialized')
+  print("-" * 50)
+  #with profile(
+  #      activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+  #      schedule=torch.profiler.schedule(wait=1, warmup=1, active=1),
+  #      on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir/bd3lm'),
+  #      record_shapes=False,
+  #      profile_memory=True,
+  #      with_stack=True,
+  #      with_flops=False,
+  #  ) as prof:
+  #    for i in range(3):
+  #      prof.step()
+  #      if i== 2:
+  #        with record_function("BD3LM_trainer.fit"):
   trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+  #print("Profiler run complete. Printing summary...")
+  print("-" * 50)
+  print("model training complete")
+  #print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
+
+  print("\n" + "-" * 50)
+  #print("To view the detailed trace, run the following command in your terminal:")
+  #print("tensorboard --logdir=./log")
+  print("-" * 50)
   
 @hydra.main(version_base=None, config_path='configs',
             config_name='config')
@@ -218,13 +248,34 @@ def main(config):
 
   if config.mode == 'sample_eval':
     config.wandb = None
+    #with profile(
+    #    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #    schedule=torch.profiler.schedule(wait=0, warmup=0, active=1),
+    #    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir/bd3lm'),
+    #    record_shapes=True,
+    #    profile_memory=True,
+    #    with_stack=True,
+    #    with_flops=True,
+    #) as prof:
+    #    for _ in range(1):
+    #        prof.step()
+    #        with record_function("BD3LM_sample"):
     samples = generate_samples(config, logger, tokenizer)
+
+    #print("Profiler run complete. Printing summary...")
+    #print("-" * 50)
+#
+    #print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=50))
+#
+    #print("\n" + "-" * 50)
+    #print("To view the detailed trace, run the following command in your terminal:")
+    #print("tensorboard --logdir=./log")
+    #print("-" * 50)
   elif config.mode == 'ppl_eval':
     config.wandb = None
     _ppl_eval(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
-
 
 if __name__ == '__main__':
   main()

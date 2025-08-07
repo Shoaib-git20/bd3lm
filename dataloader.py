@@ -329,7 +329,8 @@ def get_dataset(
     LOGGER.info(f'Loading data from: {_path}')
     return datasets.load_from_disk(_path).with_format('torch')
   LOGGER.info(f'Generating new data at: {_path}')
-  LOGGER.info(f'{streaming=}')  
+  LOGGER.info(f'{streaming=}')
+  LOGGER.info(f'{num_proc=}')  
 
   crop_train = dataset_name == 'text8-crop'
   if mode == 'train' and crop_train:
@@ -367,11 +368,12 @@ def get_dataset(
   elif dataset_name == 'openwebtext-train':
     dataset = datasets.load_dataset(
       'openwebtext',
-      split='train[:-100000]',
+      split='train[:-7900000]',
       cache_dir=cache_dir,
       revision=revision,
       streaming=False,
-      trust_remote_code=True)
+      trust_remote_code=True,
+      num_proc=num_proc)
   elif dataset_name == 'openwebtext-valid':
     dataset = datasets.load_dataset(
       'openwebtext',
@@ -379,7 +381,8 @@ def get_dataset(
       cache_dir=cache_dir,
       revision=revision,
       streaming=False,
-      trust_remote_code=True)
+      trust_remote_code=True,
+      num_proc=num_proc)
   elif dataset_name == 'scientific_papers_arxiv':
     dataset = datasets.load_dataset(
       'scientific_papers', 'arxiv',
@@ -407,7 +410,7 @@ def get_dataset(
       streaming=streaming,
       trust_remote_code=True,
       revision=revision)
-
+  print(f'Loaded dataset {dataset_name} with mode {mode}')
   if dataset_name in ['lambada', 'openwebtext-train',
                       'openwebtext-valid']:
     data = dataset
@@ -445,8 +448,8 @@ def get_dataset(
     else:
       text = example['text']
     
-    if detokenizer is not None:
-      text = _apply_detokenizer(detokenizer)(text)
+    #if detokenizer is not None:
+    #  text = _apply_detokenizer(detokenizer)(text)
 
     tokenizer.padding_side = 'right'
     tokenizer.truncation_side = 'right'
@@ -484,6 +487,7 @@ def get_dataset(
     tokenized_dataset = data.map(
       preprocess_and_tokenize,
       batched=True,
+      batch_size=256,
       num_proc=num_proc,
       load_from_cache_file=True,
       desc='Tokenizing')
@@ -500,6 +504,7 @@ def get_dataset(
     tokenized_dataset = tokenized_dataset.remove_columns(
       'text')
 
+  print(f"preprocessed {len(tokenized_dataset)} examples ")
   if not wrap:
     if not streaming:
       tokenized_dataset.save_to_disk(_path)
@@ -515,6 +520,7 @@ def get_dataset(
     chunked_dataset = tokenized_dataset.map(
       group_texts,
       batched=True,
+      batch_size=256,
       num_proc=num_proc,
       load_from_cache_file=True,
       desc='Grouping')
@@ -531,10 +537,11 @@ def get_tokenizer(config):
       from_pretrained('bert-base-uncased')
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-      config.data.tokenizer_name_or_path)
+      config.data.tokenizer_name_or_path, use_fast=True)
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):
+    print('Using GPT2 tokenizer with use_fast=True.')
     tokenizer._tokenizer.post_processor = tokenizers.processors.BertProcessing(
       (tokenizer.bos_token, tokenizer.bos_token_id),
       (tokenizer.eos_token, tokenizer.eos_token_id))
@@ -597,8 +604,10 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       insert_special_tokens=True if not hasattr(config.data, 'insert_train_special') else config.data.insert_train_special,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
+      num_proc=8,
       streaming=config.data.streaming,
       revision=config.data.get("train_revision", None))
+    print("Train set created")
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -616,8 +625,10 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode=validation_split,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
+      num_proc=8,
       streaming=config.data.streaming,
       revision=config.data.get("valid_revision", None))
+    print("Valid set created")
 
   if skip_train:
     train_loader = None
@@ -629,7 +640,9 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       pin_memory=config.loader.pin_memory,
       shuffle=not config.data.streaming,
       persistent_workers=True)
+    print("Train loader created")
     train_loader.tokenizer = tokenizer
+    print("Train loader tokenizer set is ready")
   if skip_valid:
     valid_loader = None
   else:
@@ -646,8 +659,10 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       pin_memory=config.loader.pin_memory,
       shuffle=shuffle_valid,
       generator=generator)
+    print("Valid loader created")
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
+    print("Valid loader tokenizer set is ready")
 
   return train_loader, valid_loader
 

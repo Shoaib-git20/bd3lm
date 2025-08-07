@@ -1,6 +1,6 @@
 train: openwebtext
 valid: wikitext103
 tokenizer_name_or_path: gpt2
-cache_dir: $HF_HOME/datasets/data
+cache_dir: /fs/ess/PZS0622/shoaib/.cache/huggingface/datasets/data
 wrap: True
 streaming: False

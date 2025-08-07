@@ -4,7 +4,7 @@
 #SBATCH -e watch_folder/%x_%j.err        # stderr log
 #SBATCH -N 1
 #SBATCH --get-user-env
-#SBATCH -t 0:30:00
+#SBATCH -t 01:00:00
 #SBATCH --open-mode=append
 #SBATCH --requeue
 #SBATCH --gpus-per-node=1

@@ -720,38 +720,36 @@ class Diffusion(L.LightningModule):
       self.ema.copy_to(self._get_parameters())
     self.backbone.eval()
     self.noise.eval()
-    print('Sampling from the model...')
-    print("Starting PyTorch Profiler...")
 
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir_bd3lm'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-        with_flops=True,
-    ) as prof:
-        for _ in range(3):
-            prof.step()
-            with torch.no_grad():
-                with record_function("BD3LM_sample"):
-                    samples = self._sample(
-                        seqlen=seqlen,
-                        batch_size_per_gpu=self.config.loader.eval_batch_size,
-                        num_steps=num_steps,
-                        eps=eps
-                    )
+    #with profile(
+    #    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #    schedule=torch.profiler.schedule(wait=0, warmup=0, active=1),
+    #    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir_bd3lm'),
+    #    record_shapes=True,
+    #    profile_memory=True,
+    #    with_stack=True,
+    #    with_flops=True,
+    #) as prof:
+    #    for _ in range(1):
+    #        prof.step()
+    #        with torch.no_grad():
+    with record_function("_sample"):
+        samples = self._sample(
+            seqlen=seqlen,
+            batch_size_per_gpu=self.config.loader.eval_batch_size,
+            num_steps=num_steps,
+            eps=eps
+        )
             
-    print("Profiler run complete. Printing summary...")
-    print("-" * 50)
+    #print("Profiler run complete. Printing summary...")
+    #print("-" * 50)
 
-    print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=15))
+    #print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=15))
 
-    print("\n" + "-" * 50)
-    print("To view the detailed trace, run the following command in your terminal:")
-    print("tensorboard --logdir=./log")
-    print("-" * 50)
+    #print("\n" + "-" * 50)
+    #print("To view the detailed trace, run the following command in your terminal:")
+    #print("tensorboard --logdir=./log")
+    #print("-" * 50)
 
 
     self.metrics.record_generative_perplexity(
