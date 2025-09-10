@@ -630,41 +630,42 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       revision=config.data.get("valid_revision", None))
     print("Valid set created")
 
-  if skip_train:
-    train_loader = None
-  else:
-    train_loader = torch.utils.data.DataLoader(
-      train_set,
-      batch_size=config.loader.batch_size,
-      num_workers=config.loader.num_workers,
-      pin_memory=config.loader.pin_memory,
-      shuffle=not config.data.streaming,
-      persistent_workers=True)
-    print("Train loader created")
-    train_loader.tokenizer = tokenizer
-    print("Train loader tokenizer set is ready")
-  if skip_valid:
-    valid_loader = None
-  else:
-    if valid_seed is None:
-      shuffle_valid = False
-      generator = None
-    else:
-      shuffle_valid = True
-      generator = torch.Generator().manual_seed(valid_seed)
-    valid_loader = torch.utils.data.DataLoader(
-      valid_set,
-      batch_size=config.loader.eval_batch_size,
-      num_workers=config.loader.num_workers,
-      pin_memory=config.loader.pin_memory,
-      shuffle=shuffle_valid,
-      generator=generator)
-    print("Valid loader created")
-    # Will be used in generative perplexity calculation
-    valid_loader.tokenizer = tokenizer
-    print("Valid loader tokenizer set is ready")
+  #if skip_train:
+  #  train_loader = None
+  #else:
+  #  train_loader = torch.utils.data.DataLoader(
+  #    train_set,
+  #    batch_size=config.loader.batch_size,
+  #    num_workers=config.loader.num_workers,
+  #    pin_memory=config.loader.pin_memory,
+  #    shuffle=not config.data.streaming,
+  #    persistent_workers=True)
+  #  print("Train loader created")
+  #  train_loader.tokenizer = tokenizer
+  #  print("Train loader tokenizer set is ready")
+  #if skip_valid:
+  #  valid_loader = None
+  #else:
+  #  if valid_seed is None:
+  #    shuffle_valid = False
+  #    generator = None
+  #  else:
+  #    shuffle_valid = True
+  #    generator = torch.Generator().manual_seed(valid_seed)
+  #  valid_loader = torch.utils.data.DataLoader(
+  #    valid_set,
+  #    batch_size=config.loader.eval_batch_size,
+  #    num_workers=config.loader.num_workers,
+  #    pin_memory=config.loader.pin_memory,
+  #    shuffle=shuffle_valid,
+  #    generator=generator)
+  #  print("Valid loader created")
+  #  # Will be used in generative perplexity calculation
+  #  valid_loader.tokenizer = tokenizer
+  #  print("Valid loader tokenizer set is ready")
 
-  return train_loader, valid_loader
+  #return train_loader, valid_loader
+  return train_set, valid_set
 
 
 # Samplers adapted from: https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/fault_tolerant_sampler.py

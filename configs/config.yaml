@@ -21,8 +21,8 @@ loader:
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  #num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
-  num_workers: 32
+  num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
+  #num_workers: 32
   pin_memory: True 
 
 sampling:
@@ -70,7 +70,8 @@ trainer:
   precision: 'bf16'
   fast_dev_run: True
   num_sanity_val_steps: 2
-  max_steps: 100
+  max_epochs: 10
+  max_steps: 25
   log_every_n_steps: 10
   limit_train_batches: 0.1   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 100     # validate on full dataset, can be used to toggle quick run
@@ -100,3 +101,8 @@ checkpointing:
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
+
+strategy:
+  name: ddp
+  mixed_precision: bf16
+  sharding_strategy: FULL_SHARD

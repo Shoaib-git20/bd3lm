@@ -212,28 +212,28 @@ def _train(config, logger, tokenizer):
     )
   print('Model initialized')
   print("-" * 50)
-  #with profile(
-  #      activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-  #      schedule=torch.profiler.schedule(wait=1, warmup=1, active=1),
-  #      on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir/bd3lm'),
-  #      record_shapes=False,
-  #      profile_memory=True,
-  #      with_stack=True,
-  #      with_flops=False,
-  #  ) as prof:
-  #    for i in range(3):
-  #      prof.step()
-  #      if i== 2:
-  #        with record_function("BD3LM_trainer.fit"):
-  trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
-  #print("Profiler run complete. Printing summary...")
+  with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=0, warmup=0, active=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir/bd3lm'),
+        record_shapes=False,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=False,
+    ) as prof:
+      for i in range(1):
+        prof.step()
+        if i == 0:
+          with record_function("BD3LM_trainer.fit"):
+            trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+  print("Profiler run complete. Printing summary...")
   print("-" * 50)
   print("model training complete")
-  #print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
+  print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
 
   print("\n" + "-" * 50)
-  #print("To view the detailed trace, run the following command in your terminal:")
-  #print("tensorboard --logdir=./log")
+  print("To view the detailed trace, run the following command in your terminal:")
+  print("tensorboard --logdir=./log")
   print("-" * 50)
   
 @hydra.main(version_base=None, config_path='configs',

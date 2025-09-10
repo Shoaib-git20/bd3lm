@@ -73,7 +73,7 @@ def block_diff_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
   # **4. Combine Masks **
   return block_diagonal | offset_block_causal | block_causal
 
-@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+@torch.compile(mode="default")
 def fused_flex_attention(q, k, v, mask=None):
     return flex_attention(q, k, v, block_mask=mask)
 

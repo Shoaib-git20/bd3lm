@@ -37,25 +37,12 @@ nvidia-smi
 cd /fs/ess/PZS0622/shoaib/d3pm/bd3lms
 echo "inside ${PWD}"
 
-python -u main.py \
-    loader.global_batch_size=4 \
-    loader.eval_global_batch_size=4 \
-    loader.batch_size=4 \
-    loader.eval_batch_size=4 \
-    model=tiny \
-    algo=bd3lm \
-    algo.clip_search_widths=[0.5] \
-    data=openwebtext-split \
-    data.insert_train_special=False \
-    data.insert_valid_special=False \
-    data.insert_valid_eos=False \
-    model.length=256 \
-    block_size=${BLOCK_SIZE} \
-    wandb.name=bd3lm-owt-block_size${BLOCK_SIZE} \
-    mode=train \
-    model.attn_backend=flex \
-    training.resample=True \
-    trainer.fast_dev_run=False
+mpirun -np 4 python -u main.py loader.global_batch_size=16 loader.eval_global_batch_size=16 loader.batch_size=4 loader.eval_batch_size=4 \
+    model=tiny algo=bd3lm algo.clip_search_widths=[0.5] \
+    data=openwebtext-split data.insert_train_special=False data.insert_valid_special=False data.insert_valid_eos=False \
+    model.length=128 block_size=${BLOCK_SIZE} wandb.name=bd3lm-owt-block_size${BLOCK_SIZE} \
+    mode=train model.attn_backend=flex \
+    training.resample=True trainer.fast_dev_run=False
 
 # Stop memory logger after training
 #kill $LOGGER_PID
