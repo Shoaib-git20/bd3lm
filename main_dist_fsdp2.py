@@ -25,7 +25,11 @@ from torch.distributed.fsdp.wrap import (
     wrap,
 )
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    StateDictType,
+    FullStateDictConfig,
+    ShardedStateDictConfig
+)
 
 import dataloader
 from diffusion_native import Diffusion
@@ -135,7 +139,7 @@ def setup_distributed_model(model, config, local_rank):
             sharding_strategy=sharding_strategy,
             mixed_precision=mixed_precision_policy,
             device_id=torch.cuda.current_device(),
-            use_orig_params=True,
+            use_orig_params=False,
         )
         return model
     else:
@@ -195,18 +199,26 @@ def _train(config, logger, tokenizer, device):
           logger.info(f'Resuming training from {config.checkpointing.resume_ckpt_path}')
       
       if config.strategy.name == 'fsdp':
-          with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-              checkpoint = torch.load(config.checkpointing.resume_ckpt_path)
-              model.load_state_dict(checkpoint['model_state_dict'])
+          sharded_state_dict_config = ShardedStateDictConfig(offload_to_cpu=True)
+          with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_state_dict_config):
+              checkpoint = {"model_state_dict": model.state_dict()}
+              dist.load_state_dict(
+                  checkpoint,
+                  FSDP.get_checkpoint_storage_reader(config.checkpointing.resume_ckpt_path, planner=None),
+              )
+              model.load_state_dict(checkpoint["model_state_dict"])
       else: # DDP
           map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
           checkpoint = torch.load(config.checkpointing.resume_ckpt_path, map_location=map_location)
           model.module.load_state_dict(checkpoint['model_state_dict'])
 
-      optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-      scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-      start_epoch = checkpoint.get('epoch', 0) + 1
-      current_step = checkpoint.get('step', 0)
+      # DDP and FSDP optimizer and scheduler state loading can be done commonly if not sharded
+      # Note: If you were to shard the optimizer state, this would need to be handled differently for FSDP
+      if config.strategy.name != 'fsdp':
+          optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+          scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+          start_epoch = checkpoint.get('epoch', 0) + 1
+          current_step = checkpoint.get('step', 0)
     else:
       if is_main_process():
           logger.warning(f"Checkpoint not found at {config.checkpointing.resume_ckpt_path}. Starting from scratch.")
@@ -230,10 +242,7 @@ def _train(config, logger, tokenizer, device):
         attention_mask = batch['attention_mask'].to(local_rank)
 
         optimizer.zero_grad()
-        if config.strategy.name == 'fsdp':
-            loss_obj = model.compute_loss(input_ids, attention_mask)
-        else:
-            loss_obj = model.module.compute_loss(input_ids, attention_mask)
+        loss_obj = model.module.compute_loss(input_ids, attention_mask)
         loss = loss_obj.loss
         
         loss.backward()
@@ -241,12 +250,8 @@ def _train(config, logger, tokenizer, device):
         optimizer.step()
         scheduler.step()
 
-        if config.strategy.name == 'fsdp':
-            if model.ema:
-                model.ema.update(model.parameters())
-        else:
-            if model.module.ema:
-                model.module.ema.update(model.parameters())
+        if model.module.ema:
+            model.module.ema.update(model.parameters())
 
         current_step += 1
         if is_main_process():
@@ -272,25 +277,31 @@ def _train(config, logger, tokenizer, device):
     #    logger.info(f"Epoch {epoch+1} Average Validation Loss: {avg_val_loss:.4f}")
 #
         # --- Save Checkpoint ---
-        #if is_main_process() and (epoch + 1) % config.checkpointing.save_interval == 0:
-        #    ckpt_path = os.path.join(config.checkpointing.save_dir, f"epoch_{epoch+1}_step_{current_step}.pt")
-        #    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
-        #    
-        #    if config.strategy.name == 'fsdp':
-        #        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        #            model_state = model.state_dict()
-        #    else: # DDP
-        #        model_state = model.module.state_dict()
-#
-        #    torch.save({
-        #        'epoch': epoch,
-        #        'step': current_step,
-        #        'model_state_dict': model_state,
-        #        'optimizer_state_dict': optimizer.state_dict(),
-        #        'scheduler_state_dict': scheduler.state_dict(),
-        #        'loss': avg_val_loss,
-        #    }, ckpt_path)
-        #    logger.info(f"Checkpoint saved to {ckpt_path}")
+        if (epoch + 1) % config.checkpointing.save_interval == 0:
+            ckpt_path = os.path.join(config.checkpointing.save_dir, f"epoch_{epoch+1}_step_{current_step}.pt")
+            os.makedirs(config.checkpointing.save_dir, exist_ok=True)
+            
+            if config.strategy.name == 'fsdp':
+                sharded_state_dict_config = ShardedStateDictConfig(offload_to_cpu=True)
+                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_state_dict_config):
+                    dist.save_state_dict(
+                        {"model_state_dict": model.state_dict()},
+                        FSDP.get_checkpoint_storage_writer(ckpt_path, planner=None),
+                    )
+
+            else: # DDP
+                if is_main_process():
+                    model_state = model.module.state_dict()
+                    torch.save({
+                        'epoch': epoch,
+                        'step': current_step,
+                        'model_state_dict': model_state,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        # 'loss': avg_val_loss,
+                    }, ckpt_path)
+            if is_main_process():
+                logger.info(f"Checkpoint saved to {ckpt_path}")
 
     if current_step >= max_steps:
         if is_main_process():

@@ -459,6 +459,8 @@ class DDiTBlock(nn.Module):
     self.dropout = dropout
     self.kv_cache = None
     self.cache_idx = 0
+    self.hidden_size = dim
+    self.cond_dim = cond_dim
 
     if self.adaLN:
       self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim)
@@ -557,14 +559,24 @@ class DDiTBlock(nn.Module):
     batch_size, seq_len = x.shape[0], x.shape[1]
 
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = None, None, None, None, None, None
-    if c is not None and c.shape[0] == batch_size:
-      (shift_msa, scale_msa, gate_msa, shift_mlp,
-      scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
-    elif c is not None:
-      (shift_msa, scale_msa, gate_msa, shift_mlp,
-      scale_mlp, gate_mlp) = rearrange(
+    if self.adaLN:
+      if c is not None and c.shape[0] == batch_size:
+        (shift_msa, scale_msa, gate_msa, shift_mlp,
+        scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
+      elif c is not None:
+        (shift_msa, scale_msa, gate_msa, shift_mlp,
+        scale_mlp, gate_mlp) = rearrange(
         self.adaLN_modulation(c), '(b h) d -> b h d', b=batch_size
         ).chunk(6, dim=-1)
+      else:
+        dummy_c = torch.zeros(x.shape, self.cond_dim, device=x.device, dtype=x.dtype)
+        _ = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
+        shift_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+        scale_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+        gate_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+        shift_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+        scale_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+        gate_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
 
     x_skip = x
     if c is not None:
@@ -619,6 +631,11 @@ class DDiTFinalLayer(nn.Module):
     self.linear.weight.data.zero_()
     self.linear.bias.data.zero_()
     self.adaLN = adaLN
+
+    # Store hidden_size and cond_dim for use in forward pass when creating dummy tensors
+    self.hidden_size = hidden_size
+    self.cond_dim = cond_dim
+
     if self.adaLN:
       self.adaLN_modulation = nn.Linear(cond_dim,
                                         2 * hidden_size,
@@ -628,16 +645,43 @@ class DDiTFinalLayer(nn.Module):
     self.tie_word_embeddings = tie_word_embeddings
 
   def forward(self, x, c):
-    x = self.norm_final(x)
-    if c is not None:
-      if c.shape[0] == x.shape[0]:
-        shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
-      else:
-        shift, scale = rearrange(
-          self.adaLN_modulation(c), '(b h) d -> b h d', b=x.shape[0]).chunk(2, dim=-1)
-      x = modulate_fused(x, shift, scale)
-    x = self.linear(x)
-    return x
+      x = self.norm_final(x)
+      shift, scale = None, None # Initialize shift and scale
+      if self.adaLN: # Only proceed if adaLN_modulation was instantiated
+          if c is not None:
+              # Normal operation: Conditional context 'c' (t_cond) is provided.
+              # 'c' is typically (batch_size, cond_dim), and 'x' is (batch_size, seq_len, hidden_size).
+              # The output of adaLN_modulation(c) is (batch_size, 2 * hidden_size).
+              # [:, None] adds a sequence dimension: (batch_size, 1, 2 * hidden_size)
+              # chunk(2, dim=2) splits it into two (batch_size, 1, hidden_size) tensors.
+              if c.shape[0] == x.shape[0]:
+                shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
+              else:
+                shift, scale = rearrange(
+                  self.adaLN_modulation(c), '(b h) d -> b h d', b=x.shape[0]
+                  ).chunk(2, dim=-1)
+          else:
+              # 'c' (t_cond) is None, which happens if self.parameterization == 'ar' in Diffusion.
+              # To satisfy FSDP requirements for a consistent computation graph,
+              # we must still call self.adaLN_modulation if it exists.
+              
+              # 1. Create a dummy tensor for 'c' to pass through adaLN_modulation.
+              # This ensures the forward pass of adaLN_modulation occurs.
+              dummy_c = torch.zeros(x.shape, self.cond_dim, device=x.device, dtype=x.dtype)
+              _ = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
+              
+              # 2. Create zero-effect shift and scale tensors.
+              # For modulate_fused (x * (1 + scale) + shift), a no-op means shift=0 and scale=0.
+              # These tensors must match the shape of the actual shift/scale: (batch_size, 1, hidden_size).
+              shift = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+              scale = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+      
+      # Apply modulation if shift and scale were computed (i.e., if self.adaLN was True)
+      if shift is not None and scale is not None:
+          x = modulate_fused(x, shift, scale)
+
+      x = self.linear(x)
+      return x
 
 
 class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
