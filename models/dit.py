@@ -322,6 +322,8 @@ class DDiTBlockCausal(nn.Module):
       self.adaLN_modulation.bias.data.zero_()
     self.attn_backend = attn_backend
     self.kv_cache = None
+    self.cond_dim = cond_dim
+    self.hidden_size = dim
 
   def _get_bias_dropout_scale(self):
     if self.training:
@@ -391,10 +393,19 @@ class DDiTBlockCausal(nn.Module):
       scale_mlp, gate_mlp) = rearrange(
         self.adaLN_modulation(c), '(b h) d -> b h d', b=batch_size
         ).chunk(6, dim=-1)
+    else:
+      dummy_c = torch.zeros(x.shape, self.cond_dim, device=x.device, dtype=x.dtype)
+      _ = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
+      shift_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+      scale_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+      gate_msa = torch.ones(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+      shift_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+      scale_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+      gate_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
 
     # attention operation
     x_skip = x
-    if c is not None:
+    if self.adaLN:
       x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
     else:
       x = self.norm1(x)
@@ -411,7 +422,7 @@ class DDiTBlockCausal(nn.Module):
     else:
       x = self.cross_attn(qkv, c)
       
-    if c is not None:
+    if self.adaLN:
       x = bias_dropout_scale_fn(self.attn_out(x),
         None,
         gate_msa,
@@ -507,7 +518,7 @@ class DDiTBlock(nn.Module):
   
   def attn_mlp(self, x, c, gate_msa, gate_mlp, shift_mlp, scale_mlp, x_skip):
     bias_dropout_scale_fn = self._get_bias_dropout_scale()
-    if c is not None:
+    if self.adaLN:
       x = bias_dropout_scale_fn(self.attn_out(x),
         None,
         gate_msa,
@@ -573,13 +584,13 @@ class DDiTBlock(nn.Module):
         _ = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
         shift_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
         scale_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-        gate_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+        gate_msa = torch.ones(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
         shift_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
         scale_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
         gate_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
 
     x_skip = x
-    if c is not None:
+    if self.adaLN:
       x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
     else:
       x = self.norm1(x)
@@ -668,14 +679,18 @@ class DDiTFinalLayer(nn.Module):
               # 1. Create a dummy tensor for 'c' to pass through adaLN_modulation.
               # This ensures the forward pass of adaLN_modulation occurs.
               dummy_c = torch.zeros(x.shape, self.cond_dim, device=x.device, dtype=x.dtype)
-              _ = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
+              dummy_output = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
               
               # 2. Create zero-effect shift and scale tensors.
               # For modulate_fused (x * (1 + scale) + shift), a no-op means shift=0 and scale=0.
               # These tensors must match the shape of the actual shift/scale: (batch_size, 1, hidden_size).
               shift = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
               scale = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-      
+
+              # 3. Add the zero-impact dependency to prevent dead-code elimination.
+              shift = shift + dummy_output.sum() * 0
+              scale = scale + dummy_output.sum() * 0
+
       # Apply modulation if shift and scale were computed (i.e., if self.adaLN was True)
       if shift is not None and scale is not None:
           x = modulate_fused(x, shift, scale)
