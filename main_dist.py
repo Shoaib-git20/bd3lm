@@ -32,6 +32,13 @@ from diffusion_native import Diffusion
 from models.dit import DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer 
 import utils
 import metrics
+from dataclasses import dataclass
+
+@dataclass
+class Loss:
+  loss: torch.FloatTensor
+  nlls: torch.FloatTensor
+  token_mask: torch.FloatTensor
 
 # DDP Setup
 def setup_ddp():
@@ -117,7 +124,7 @@ def setup_distributed_model(model, config, local_rank):
         dit_auto_wrap_policy = functools.partial(
            transformer_auto_wrap_policy,
            transformer_layer_cls={
-               DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer
+               DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer
            })
 
         if config.strategy.sharding_strategy == 'FULL_SHARD':
@@ -214,6 +221,9 @@ def _train(config, logger, tokenizer, device):
   # --- Training Loop ---
   max_steps = config.trainer.max_steps
   training_complete = False
+  if config.strategy.name == 'fsdp':
+      model.sampling_eps_min = torch.tensor(config.training.sampling_eps_min)
+      model.sampling_eps_max = torch.tensor(config.training.sampling_eps_max)
 
   for epoch in range(start_epoch, 1000): # Loop for a large number of epochs
     train_sampler.set_epoch(epoch)
@@ -232,8 +242,33 @@ def _train(config, logger, tokenizer, device):
         optimizer.zero_grad()
         if config.strategy.name == 'fsdp':
             loss_obj = model.compute_loss(input_ids, attention_mask)
+            if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
+              sampling_eps_min = model.sampling_eps_min.item()
+              sampling_eps_max = model.sampling_eps_max.item()
+            elif not hasattr(model, 'sampling_eps_min'):
+              sampling_eps_min = 1e-3
+              sampling_eps_max = 1.0
+
+            (input_tokens, output_tokens, attention_mask) = model._maybe_sub_sample(input_ids, attention_mask)
+
+            if model.parameterization == 'ar':
+              output = model.forward(input_tokens, None)
+              loss = - output.gather(-1, output_tokens[:, :, None])[:, :, 0]
+            else:
+              loss = model._forward_pass_diffusion(
+                input_tokens,
+                sampling_eps_min=sampling_eps_min,
+                sampling_eps_max=sampling_eps_max)
+
+            if model.ignore_bos and not model.training:
+              attention_mask[:, 0] = 0
+
+            nlls = (loss * attention_mask)
+            token_nll = nlls.sum() / attention_mask.sum()
+            loss_obj = Loss(loss=token_nll, nlls=nlls, token_mask=attention_mask)
         else:
             loss_obj = model.module.compute_loss(input_ids, attention_mask)
+        
         loss = loss_obj.loss
         
         loss.backward()
