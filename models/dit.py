@@ -219,7 +219,6 @@ class LayerNorm(nn.Module):
       x = F.layer_norm(x.float(), [self.dim])
     return x * self.weight[None, None, :]
 
-
 def residual_linear(x, W, x_skip, residual_scale):
   """x_skip + residual_scale * W @ x"""
   dim_out, dim_in = W.shape[0], W.shape[1]
