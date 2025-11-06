@@ -18,6 +18,7 @@ from torch.distributed.fsdp import (
     BackwardPrefetch,
     ShardingStrategy,
     CPUOffload,
+    fully_shard,
 )
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
@@ -105,7 +106,7 @@ def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: 
     with fsspec.open(f'{save_dir}/config_tree.txt', 'w') as fp:
       rich.print(tree, file=fp)
 
-def setup_fsdp_model(model, config, local_rank):
+def setup_fsdp_model(model, config, local_rank, mesh=None):
    # Configure mixed precision
     mixed_precision_policy = None
     if config.strategy.get('mixed_precision', 'fp32') == 'bf16':
@@ -120,6 +121,8 @@ def setup_fsdp_model(model, config, local_rank):
             reduce_dtype=torch.float16,
             buffer_dtype=torch.float16,
         )
+    elif config.strategy.get('name', 'ddp') == '3d':
+        mixed_precision_policy = None
     # Define transformer wrapping policy
     dit_auto_wrap_policy = functools.partial(
        transformer_auto_wrap_policy,
@@ -132,17 +135,31 @@ def setup_fsdp_model(model, config, local_rank):
         sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
     elif config.strategy.sharding_strategy == 'HYBRID_SHARD':
         sharding_strategy = ShardingStrategy.HYBRID_SHARD
+    elif config.strategy.get('name', 'ddp') == '3d':
+        sharding_strategy = None
     else:
         raise ValueError(f"Unknown sharding strategy: {config.strategy.sharding_strategy}")
     # Initialize FSDP wrapped model
-    model = FSDP(
-        model,
-        auto_wrap_policy=dit_auto_wrap_policy,
-        sharding_strategy=sharding_strategy,
-        mixed_precision=mixed_precision_policy,
-        device_id=torch.cuda.current_device(),
-        use_orig_params=True,
-    )
+    if config.strategy.get('name') == '3d':
+        model = FSDP(
+            model,
+            auto_wrap_policy=dit_auto_wrap_policy,
+            sharding_strategy=sharding_strategy,
+            mixed_precision=mixed_precision_policy,
+            device_id=torch.cuda.current_device(),
+            use_orig_params=True,
+            mesh=mesh,
+        )
+        return model
+    else :
+        model = FSDP(
+            model,
+            auto_wrap_policy=dit_auto_wrap_policy,
+            sharding_strategy=sharding_strategy,
+            mixed_precision=mixed_precision_policy,
+            device_id=torch.cuda.current_device(),
+            use_orig_params=True,
+        )
     return model
 
 def setup_tp_model(model, config, local_rank, tp_size, rank, world_size):
@@ -214,6 +231,7 @@ def setup_tp_model(model, config, local_rank, tp_size, rank, world_size):
             "parallelize_module failed. Make sure your PyTorch version supports torch.distributed.tensor.parallel "
             "and DeviceMesh (PyTorch >= 2.3 / 2.4 recommended). Original error: " + str(e)
         )
+    return model
    
 
 def setup_distributed_model(model, config, local_rank):
@@ -250,6 +268,45 @@ def setup_distributed_model(model, config, local_rank):
         model = setup_tp_model(model, config, local_rank, tp_size, rank, world_size)
 
         return model
+    elif strategy_name == '3d':
+        print(f"[Debug] Initializing 3D parallel strategy...")
+        tp_size = 2
+        world_size = dist.get_world_size()
+        print(f"[Debug] World size: {world_size}, TP size: {tp_size}")
+        
+        assert world_size % (tp_size) == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
+        dp_size = world_size // (tp_size)
+        print(f"[Debug] Calculated DP size: {dp_size}")
+        
+        print(f"[Debug] Initializing 2D device mesh with shape ({tp_size}, {dp_size})")
+        mesh_2d = init_device_mesh("cuda", (tp_size, dp_size))
+        print(f"[Debug] Device mesh initialized: {mesh_2d}")
+        
+        tp_mesh = mesh_2d["tp"]  # a submesh that connects intra-host devices
+        dp_mesh = mesh_2d["dp"]  # a submesh that connects inter-host devices
+        print(f"[Debug] Created TP mesh: {tp_mesh}")
+        print(f"[Debug] Created DP mesh: {dp_mesh}")
+        
+        rank = dist.get_rank()
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
+        print(f"[Debug] Process rank {rank} moving model to device {device}")
+
+        model = model.to(device)
+        print(f"[Debug] Setting up Tensor Parallel model...")
+        model = setup_tp_model(model, config, local_rank, tp_size, rank, world_size)
+        print(f"[Debug] TP model setup complete")
+        
+        # apply Tensor Parallel intra-host on tp_mesh
+        print(f"[Debug] Applying parallelization with TP mesh...")
+        model_tp = parallelize_module(model, tp_mesh)
+        print(f"[Debug] TP parallelization complete")
+        
+        # apply FSDP inter-host on dp_mesh
+        print(f"[Debug] Setting up FSDP with DP mesh...")
+        model = setup_fsdp_model(model_tp, config, local_rank, mesh=dp_mesh)
+        print(f"[Debug] FSDP setup complete")
+        print(f"[Debug] 3D parallel strategy initialization complete")
     else:
         raise ValueError(f"Unknown distributed strategy: {strategy_name}")
 
