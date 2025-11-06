@@ -105,6 +105,117 @@ def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: 
     with fsspec.open(f'{save_dir}/config_tree.txt', 'w') as fp:
       rich.print(tree, file=fp)
 
+def setup_fsdp_model(model, config, local_rank):
+   # Configure mixed precision
+    mixed_precision_policy = None
+    if config.strategy.get('mixed_precision', 'fp32') == 'bf16':
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+    elif config.strategy.get('mixed_precision', 'fp32') == 'fp16':
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float16,
+            buffer_dtype=torch.float16,
+        )
+    # Define transformer wrapping policy
+    dit_auto_wrap_policy = functools.partial(
+       transformer_auto_wrap_policy,
+       transformer_layer_cls={
+           DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer
+       })
+    if config.strategy.sharding_strategy == 'FULL_SHARD':
+        sharding_strategy = ShardingStrategy.FULL_SHARD
+    elif config.strategy.sharding_strategy == 'SHARD_GRAD_OP':
+        sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
+    elif config.strategy.sharding_strategy == 'HYBRID_SHARD':
+        sharding_strategy = ShardingStrategy.HYBRID_SHARD
+    else:
+        raise ValueError(f"Unknown sharding strategy: {config.strategy.sharding_strategy}")
+    # Initialize FSDP wrapped model
+    model = FSDP(
+        model,
+        auto_wrap_policy=dit_auto_wrap_policy,
+        sharding_strategy=sharding_strategy,
+        mixed_precision=mixed_precision_policy,
+        device_id=torch.cuda.current_device(),
+        use_orig_params=True,
+    )
+    return model
+
+def setup_tp_model(model, config, local_rank, tp_size, rank, world_size):
+    mesh = init_device_mesh("cuda", (tp_size,))
+    print(f"[rank {rank}] DeviceMesh initialized with shape {(tp_size,)}")
+    # mesh_shape = (world_size,)
+    # device_ids = list(range(world_size))
+    # mesh = init_device_mesh(device_ids, mesh_shape)
+    # Define parallelization rules for layers
+    tp_layer_plan_patterns = {
+       "vocab_embed.embedding": "replicated",
+       "blocks.*.norm1": "sequence",
+       "blocks.*.norm2": "sequence",
+       "blocks.*.attn_qkv": "column",
+       "blocks.*.attn_out": "row",
+       "blocks.*.mlp.0": "column",
+       "blocks.*.mlp.2": "row",
+       "blocks.*.adaLN_modulation": "replicated",
+       "output_layer.norm_final": "sequence",
+       "output_layer.linear": "row",
+    }
+    def _pattern_to_regex(pattern: str):
+        # Escape dots and other chars, convert '*' to '.*'
+        # e.g. "blocks.*.attn_qkv" -> ^blocks\..*\.attn_qkv$
+        esc = re.escape(pattern)
+        regex = "^" + esc.replace(r"\*", ".*") + "$"
+        return re.compile(regex)
+    # Create list of compiled patterns
+    compiled_patterns = [(repl, _pattern_to_regex(pat)) for pat, repl in tp_layer_plan_patterns.items()]
+    def build_parallelize_plan(model):
+        """
+        Return dict mapping module FQN -> ParallelStyle() (ColwiseParallel/RowwiseParallel)
+        Only include modules that match patterns and have a parallel style (i.e., skip 'replicated').
+        """
+        plan = {}
+        for name, module in model.named_modules():
+            # try matching each pattern; the first matching pattern will apply
+            for pattern, cre in compiled_patterns:
+                if cre.match(name):
+                    strategy = pattern # pattern variable contains e.g. "column", "row", "replicated"
+                    if pattern == "column":
+                        plan[name] = ColwiseParallel()
+                    elif pattern == "row":
+                        plan[name] = RowwiseParallel()
+                    elif pattern == "sequence":
+                        plan[name] = SequenceParallel()
+                    else:
+                        pass # 'replicated' or any None -> do not add to plan (default is replicated)
+                    break
+        return plan
+    # Build the plan using the actual model instance
+    # Note: ensure 'model' is defined above this snippet (your instantiated DIT model)
+    parallelize_plan = build_parallelize_plan(model)
+    # Debug print the plan (for rank 0)
+    if rank == 0:
+        print("Tensor Parallelize plan (FQN -> ParallelStyle):")
+        for k, v in parallelize_plan.items():
+            print(f"  {k} -> {v}")
+    # ---------- 5) Apply parallelize_module ----------
+    # This will transform parameters into DTensor and shard weights according to the plan.
+    # It must be called on all ranks.
+    # The src_data_rank argument defaults to 0 (rank that has the data if needed); we keep default here.
+    try:
+        parallelize_module(model, device_mesh=mesh, parallelize_plan=parallelize_plan)
+        print(f"[rank {rank}] parallelize_module done")
+    except Exception as e:
+        # If the API call fails (version mismatch), give a helpful message:
+        raise RuntimeError(
+            "parallelize_module failed. Make sure your PyTorch version supports torch.distributed.tensor.parallel "
+            "and DeviceMesh (PyTorch >= 2.3 / 2.4 recommended). Original error: " + str(e)
+        )
+   
+
 def setup_distributed_model(model, config, local_rank):
     """Sets up the model for distributed training with DDP or FSDP."""
     
@@ -113,136 +224,32 @@ def setup_distributed_model(model, config, local_rank):
     if strategy_name == 'ddp':
         model = model.to(local_rank)
         return DDP(model, device_ids=[local_rank])
-    
+
     elif strategy_name == 'fsdp':
-        # Configure mixed precision
-        mixed_precision_policy = None
-        if config.strategy.get('mixed_precision', 'fp32') == 'bf16':
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat16,
-            )
-        elif config.strategy.get('mixed_precision', 'fp32') == 'fp16':
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.float16,
-                reduce_dtype=torch.float16,
-                buffer_dtype=torch.float16,
-            )
-
-        # Define transformer wrapping policy
-        dit_auto_wrap_policy = functools.partial(
-           transformer_auto_wrap_policy,
-           transformer_layer_cls={
-               DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer
-           })
-
-        if config.strategy.sharding_strategy == 'FULL_SHARD':
-            sharding_strategy = ShardingStrategy.FULL_SHARD
-        elif config.strategy.sharding_strategy == 'SHARD_GRAD_OP':
-            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
-        elif config.strategy.sharding_strategy == 'HYBRID_SHARD':
-            sharding_strategy = ShardingStrategy.HYBRID_SHARD
-        else:
-            raise ValueError(f"Unknown sharding strategy: {config.strategy.sharding_strategy}")
-        # Initialize FSDP wrapped model
-        model = FSDP(
-            model,
-            auto_wrap_policy=dit_auto_wrap_policy,
-            sharding_strategy=sharding_strategy,
-            mixed_precision=mixed_precision_policy,
-            device_id=torch.cuda.current_device(),
-            use_orig_params=True,
-        )
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        print(f"[rank {rank}/{world_size}] running on device {device}")
+        model = setup_fsdp_model(model, config, local_rank)
         return model
+        
     elif strategy_name == 'tp':
         # Initialize device mesh for tensor parallelism
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or 0))
+        #local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or 0))
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-        print(f"[rank {rank}/{world_size}] running on device {device}")
+        print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
         tp_size = 2
         if world_size < tp_size or world_size % tp_size != 0:
             pass
 
         model = model.to(device)
 
-        mesh = init_device_mesh("cuda", (tp_size,))
-        print(f"[rank {rank}] DeviceMesh initialized with shape {(tp_size,)}")
-        # mesh_shape = (world_size,)
-        # device_ids = list(range(world_size))
-        # mesh = init_device_mesh(device_ids, mesh_shape)
+        model = setup_tp_model(model, config, local_rank, tp_size, rank, world_size)
 
-        # Define parallelization rules for layers
-        tp_layer_plan_patterns = {
-           "vocab_embed.embedding": "replicated",
-           "blocks.*.norm1": "sequence",
-           "blocks.*.norm2": "sequence",
-           "blocks.*.attn_qkv": "column",
-           "blocks.*.attn_out": "row",
-           "blocks.*.mlp.0": "column",
-           "blocks.*.mlp.2": "row",
-           "blocks.*.adaLN_modulation": "replicated",
-           "output_layer.norm_final": "sequence",
-           "output_layer.linear": "row",
-        }
-
-        def _pattern_to_regex(pattern: str):
-            # Escape dots and other chars, convert '*' to '.*'
-            # e.g. "blocks.*.attn_qkv" -> ^blocks\..*\.attn_qkv$
-            esc = re.escape(pattern)
-            regex = "^" + esc.replace(r"\*", ".*") + "$"
-            return re.compile(regex)
-
-        # Create list of compiled patterns
-        compiled_patterns = [(repl, _pattern_to_regex(pat)) for pat, repl in tp_layer_plan_patterns.items()]
-
-        def build_parallelize_plan(model):
-            """
-            Return dict mapping module FQN -> ParallelStyle() (ColwiseParallel/RowwiseParallel)
-            Only include modules that match patterns and have a parallel style (i.e., skip 'replicated').
-            """
-            plan = {}
-            for name, module in model.named_modules():
-                # try matching each pattern; the first matching pattern will apply
-                for pattern, cre in compiled_patterns:
-                    if cre.match(name):
-                        strategy = pattern # pattern variable contains e.g. "column", "row", "replicated"
-                        if pattern == "column":
-                            plan[name] = ColwiseParallel()
-                        elif pattern == "row":
-                            plan[name] = RowwiseParallel()
-                        elif pattern == "sequence":
-                            plan[name] = SequenceParallel()
-                        else:
-                            pass # 'replicated' or any None -> do not add to plan (default is replicated)
-                        break
-            return plan
-
-        # Build the plan using the actual model instance
-        # Note: ensure 'model' is defined above this snippet (your instantiated DIT model)
-        parallelize_plan = build_parallelize_plan(model)
-
-        # Debug print the plan (for rank 0)
-        if rank == 0:
-            print("Tensor Parallelize plan (FQN -> ParallelStyle):")
-            for k, v in parallelize_plan.items():
-                print(f"  {k} -> {v}")
-
-        # ---------- 5) Apply parallelize_module ----------
-        # This will transform parameters into DTensor and shard weights according to the plan.
-        # It must be called on all ranks.
-        # The src_data_rank argument defaults to 0 (rank that has the data if needed); we keep default here.
-        try:
-            parallelize_module(model, device_mesh=mesh, parallelize_plan=parallelize_plan)
-            print(f"[rank {rank}] parallelize_module done")
-        except Exception as e:
-            # If the API call fails (version mismatch), give a helpful message:
-            raise RuntimeError(
-                "parallelize_module failed. Make sure your PyTorch version supports torch.distributed.tensor.parallel "
-                "and DeviceMesh (PyTorch >= 2.3 / 2.4 recommended). Original error: " + str(e)
-            )
+        return model
     else:
         raise ValueError(f"Unknown distributed strategy: {strategy_name}")
 
