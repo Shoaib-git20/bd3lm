@@ -341,7 +341,7 @@ def _train(config, logger, tokenizer, device):
         attention_mask = batch['attention_mask'].to(local_rank)
 
         optimizer.zero_grad()
-        if config.strategy.name in ('fsdp', 'tp'):
+        if config.strategy.name in ('fsdp', 'tp', '3d'):
             loss_obj = model.compute_loss(input_ids, attention_mask)
             if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
               sampling_eps_min = model.sampling_eps_min.item()
@@ -377,7 +377,7 @@ def _train(config, logger, tokenizer, device):
         optimizer.step()
         scheduler.step()
 
-        if config.strategy.name in ('fsdp', 'tp'):
+        if config.strategy.name in ('fsdp', 'tp', '3d'):
             if model.ema:
                 model.ema.update(model.parameters())
         else:
