@@ -541,7 +541,7 @@ def get_tokenizer(config):
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):
-    print('Using GPT2 tokenizer with use_fast=True.')
+    #print('Using GPT2 tokenizer with use_fast=True.')
     tokenizer._tokenizer.post_processor = tokenizers.processors.BertProcessing(
       (tokenizer.bos_token, tokenizer.bos_token_id),
       (tokenizer.eos_token, tokenizer.eos_token_id))

@@ -117,8 +117,8 @@ def setup_fsdp_model(model, config, local_rank, mesh=None):
     except Exception:
         _ws = None
         _rk = None
-    print(f"[Debug][FSDP setup] local_rank={local_rank} rank={_rk} world_size={_ws} mesh_provided={'yes' if mesh is not None else 'no'}")
-    print(f"[Debug][FSDP setup] requested sharding_strategy={getattr(config.strategy, 'sharding_strategy', None)} mixed_precision={config.strategy.get('mixed_precision', 'fp32')}")
+    #print(f"[Debug][FSDP setup] local_rank={local_rank} rank={_rk} world_size={_ws} mesh_provided={'yes' if mesh is not None else 'no'}")
+    #print(f"[Debug][FSDP setup] requested sharding_strategy={getattr(config.strategy, 'sharding_strategy', None)} mixed_precision={config.strategy.get('mixed_precision', 'fp32')}")
    # Configure mixed precision
     mixed_precision_policy = None
     if config.strategy.get('mixed_precision', 'fp32') == 'bf16':
@@ -176,10 +176,10 @@ def setup_fsdp_model(model, config, local_rank, mesh=None):
 
 def setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh=None):
     # Debug: entering TP model setup
-    print(f"[Debug][TP setup] entering setup_tp_model: rank={rank} world_size={world_size} local_rank={local_rank} tp_size={tp_size}")
+    #print(f"[Debug][TP setup] entering setup_tp_model: rank={rank} world_size={world_size} local_rank={local_rank} tp_size={tp_size}")
     if tp_mesh is None:
         tp_mesh = init_device_mesh("cuda", (tp_size,))
-    print(f"[Debug][TP setup] DeviceMesh initialized with shape {(tp_size,)} -> {tp_mesh}")
+    #print(f"[Debug][TP setup] DeviceMesh initialized with shape {(tp_size,)} -> {tp_mesh}")
     # mesh_shape = (world_size,)
     # device_ids = list(range(world_size))
     # mesh = init_device_mesh(device_ids, mesh_shape)
@@ -227,17 +227,17 @@ def setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh
     # Note: ensure 'model' is defined above this snippet (your instantiated DIT model)
     parallelize_plan = build_parallelize_plan(model)
     # Debug print the plan (for rank 0)
-    if rank == 0:
-        print("Tensor Parallelize plan (FQN -> ParallelStyle):")
-        for k, v in parallelize_plan.items():
-            print(f"  {k} -> {v}")
+    #if rank == 0:
+    #    print("Tensor Parallelize plan (FQN -> ParallelStyle):")
+    #    for k, v in parallelize_plan.items():
+    #        print(f"  {k} -> {v}")
     # ---------- 5) Apply parallelize_module ----------
     # This will transform parameters into DTensor and shard weights according to the plan.
     # It must be called on all ranks.
     # The src_data_rank argument defaults to 0 (rank that has the data if needed); we keep default here.
     try:
         parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=parallelize_plan)
-        print(f"[rank {rank}] parallelize_module done")
+        #print(f"[rank {rank}] parallelize_module done")
     except Exception as e:
         # If the API call fails (version mismatch), give a helpful message:
         raise RuntimeError(
@@ -247,22 +247,22 @@ def setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh
     return model
    
 
-def setup_distributed_model(model, config, local_rank):
+def setup_distributed_model(model, logger, config, local_rank):
     """Sets up the model for distributed training with DDP or FSDP."""
     
     strategy_name = config.strategy.get('name', 'ddp') # Default to DDP
     # Debug: surface selection info
-    try:
-        _world_size = dist.get_world_size()
-        _rank = dist.get_rank()
-    except Exception:
-        _world_size = None
-        _rank = None
-    print(f"[Debug][setup_distributed_model] strategy={strategy_name} local_rank={local_rank} rank={_rank} world_size={_world_size}")
+    #try:
+    #    _world_size = dist.get_world_size()
+    #    _rank = dist.get_rank()
+    #except Exception:
+    #    _world_size = None
+    #    _rank = None
+    #print(f"[Debug][setup_distributed_model] strategy={strategy_name} local_rank={local_rank} rank={_rank} world_size={_world_size}")
     
     if strategy_name == 'ddp':
         # DDP: move model to the local CUDA device and wrap with DistributedDataParallel
-        print(f"[Debug][DDP] rank={_rank} local_rank={local_rank} wrapping model with DDP on cuda:{local_rank}")
+        #print(f"[Debug][DDP] rank={_rank} local_rank={local_rank} wrapping model with DDP on cuda:{local_rank}")
         model = model.to(local_rank)
         return DDP(model, device_ids=[local_rank])
 
@@ -271,9 +271,10 @@ def setup_distributed_model(model, config, local_rank):
         rank = dist.get_rank()
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
-        print(f"[rank {rank}/{world_size}] running on device {device}")
-        print(f"[Debug][FSDP] wrapping model with FSDP (local_rank={local_rank})")
+        #print(f"[rank {rank}/{world_size}] running on device {device}")
+        #print(f"[Debug][FSDP] wrapping model with FSDP (local_rank={local_rank})")
         model = setup_fsdp_model(model, config, local_rank)
+        logger.info(f"FSDP model setup complete on world_size={world_size} rank={rank}")
         return model
         
     elif strategy_name == 'tp':
@@ -283,51 +284,102 @@ def setup_distributed_model(model, config, local_rank):
         #local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or 0))
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
         tp_size = 2
-        print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
-        print(f"[Debug][TP] preparing tensor-parallel setup: tp_size={tp_size} local_rank={local_rank} rank={rank} world_size={world_size}")
+        #print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
+        #print(f"[Debug][TP] preparing tensor-parallel setup: tp_size={tp_size} local_rank={local_rank} rank={rank} world_size={world_size}")
         if world_size < tp_size or world_size % tp_size != 0:
             pass
 
         model = model.to(device)
 
         model = setup_tp_model(model, config, local_rank, tp_size, rank, world_size)
+        logger.info(f"TP model setup complete with tp_size={tp_size} on world_size={world_size} rank={rank}")
 
         return model
     elif strategy_name == '3d':
-        print(f"[Debug] Initializing 3D parallel strategy...")
-        print(f"[Debug][3D] local_rank={local_rank} rank={dist.get_rank()} world_size={dist.get_world_size()}")
         tp_size = 2
         world_size = dist.get_world_size()
-        print(f"[Debug] World size: {world_size}, TP size: {tp_size}")
-        
+        rank = dist.get_rank()
+        logger.info(f"[Debug][3D] Initializing 3D parallel strategy with tp_size={tp_size} on world_size={world_size}...")
+        #print(f"[Debug][3D] local_rank={local_rank} rank={rank} World size: {world_size}, TP size: {tp_size}")
+
         assert world_size % (tp_size) == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
         dp_size = world_size // (tp_size)
-        print(f"[Debug] Calculated DP size: {dp_size}")
-        
-        print(f"[Debug] Initializing 2D device mesh with shape ({tp_size}, {dp_size})")
+
+        logger.info(f"[Debug][3D] Initializing 2D device mesh with shape ({dp_size}, {tp_size})")
         mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-        print(f"[Debug] Device mesh initialized: {mesh_2d}")
-        
+        logger.info(f"[Debug][3D] Device mesh initialized: {mesh_2d}")
+
         tp_mesh = mesh_2d["tp"]  # a submesh that connects intra-host devices
         dp_mesh = mesh_2d["dp"]  # a submesh that connects inter-host devices
-        print(f"[Debug] Created TP mesh: {tp_mesh}")
-        print(f"[Debug] Created DP mesh: {dp_mesh}")
-        
-        rank = dist.get_rank()
+        tp_group = tp_mesh.get_group()
+
+        #logger.info(f"[Debug][3D] TP mesh: {tp_mesh}, group size={tp_size}")
+        #logger.info(f"[Debug][3D] Created DP mesh: {dp_mesh}")
+
+        # --- Enable symmetric memory for this TP group ---
+
+        #logger.info(f"[Debug][3D] Enabling symmetric memory for TP group...")
+        try:
+            # If user code already provided a name string
+            if isinstance(tp_group, str):
+                group_name = tp_group
+            else:
+                # Common attribute added by DeviceMesh.get_group() in many PyTorch builds
+                group_name = getattr(tp_group, "group_name", None)
+
+                # alternate attribute names some builds expose
+                if group_name is None:
+                    group_name = getattr(tp_group, "name", None)
+                if group_name is None and hasattr(tp_group, "get_group_name"):
+                    try:
+                        group_name = tp_group.get_group_name()
+                    except Exception:
+                        group_name = None
+
+            if not group_name:
+                raise RuntimeError(
+                    "Could not determine the process-group name for tp_group. "
+                    "enable_symm_mem_for_group requires a string group name (e.g. tp_group.group_name). "
+                    "If your ProcessGroup object has no name, create or obtain a named ProcessGroup "
+                    "from DeviceMesh.get_group() or upgrade PyTorch so DeviceMesh exposes group_name."
+                )
+
+            # Now call the symmetric memory helper with the string name:
+            enable_symm_mem_for_group(group_name)
+            #logger.info(f"[Debug][3D] Symmetric memory enabled for group '{group_name}'")
+
+        except Exception as e:
+            # bubble up a clearer error showing what we received
+            raise RuntimeError(
+                f"Failed to enable symmetric memory for TP group. tp_group type={type(tp_group)}, "
+                f"attrs={[a for a in dir(tp_group) if not a.startswith('__')] if not isinstance(tp_group, str) else 'string'}; "
+                f"error={e}"
+            ) from e
+
+        # --- Configure torch.compile for async TP ---
+        torch._inductor.config._micro_pipeline_tp = True
+        #logger.info(f"[Debug][3D] torch.compile micro-pipeline async-TP mode enabled.")
+
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-        print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
-        print(f"[Debug] Process rank {rank} moved model to device {device}")
+        #print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
+        #logger.info(f"[Debug][3D] Process rank {rank} moved model to device {device}")
 
         model = model.to(device)
-        print(f"[Debug] Setting up Tensor Parallel model...")
+        #logger.info(f"[Debug][3D] Setting up Tensor Parallel model...")
         model_tp = setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh=tp_mesh)
-        print(f"[Debug] TP model setup complete")
-        
+        logger.info(f"[Debug][3D] TP model setup complete.")
+
         # apply FSDP inter-host on dp_mesh
-        print(f"[Debug] Setting up FSDP with DP mesh...")
-        model = setup_fsdp_model(model_tp, config, local_rank, mesh=dp_mesh)
-        print(f"[Debug] FSDP setup complete")
-        print(f"[Debug] 3D parallel strategy initialization complete")
+        #logger.info(f"[Debug][3D] Setting up FSDP with DP mesh = {dp_mesh}...")
+        model_tp = setup_fsdp_model(model_tp, config, local_rank, mesh=dp_mesh)
+        logger.info(f"[Debug][3D] FSDP setup complete")
+
+        try:
+            model_tp = torch.compile(model_tp)
+            #logger.info(f"[Debug][3D] Model compiled with torch.compile for async TP.")
+        except Exception as e:
+            logger.warning(f"[Warning] torch.compile(model) failed: {e}")
+        logger.info(f"[Debug][3D] Model is now wrapped with 3D parallelism (TP + FSDP).")
 
     elif strategy_name == "async_tp":
         # async tensor-parallel only (1 node, 2 GPUs per node)
@@ -336,7 +388,6 @@ def setup_distributed_model(model, config, local_rank):
         tp_size = 2
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
         assert world_size == tp_size, (
             f"async_tp expects single node with {tp_size} GPUs, got world_size={world_size}"
@@ -407,11 +458,6 @@ def setup_distributed_model(model, config, local_rank):
         except Exception as e:
             print(f"[Warning] torch.compile(model) failed: {e}")
 
-        # Example: compile only specific TP region if you want finer control
-        # if hasattr(model, "tp_submodule"):
-        #     model.tp_submodule = torch.compile(model.tp_submodule)
-        #     print("[Debug] Only TP submodule compiled for async TP.")
-
         print("[Debug] async-TP initialization complete (no FSDP/DP applied).")
 
     else:
@@ -423,7 +469,7 @@ def _train(config, logger, tokenizer, device):
   local_rank = int(os.environ["LOCAL_RANK"])
   
   if is_main_process():
-      logger.info(f'Starting {config.strategy.name} Training.')
+      logger.info(f'Starting {config.strategy.name} Training with world size {os.environ["WORLD_SIZE"]}.')
 
   # --- Setup DDP DataLoaders ---
   train_set, valid_set = dataloader.get_dataloaders(config, tokenizer)
@@ -441,7 +487,7 @@ def _train(config, logger, tokenizer, device):
     persistent_workers=True)
   
   train_loader.tokenizer = tokenizer
-  print("Train loader created and train tokenizer set is ready")
+  logger.info("Train loader created and train tokenizer set is ready")
 
   valid_loader = torch.utils.data.DataLoader(
     valid_set,
@@ -453,12 +499,12 @@ def _train(config, logger, tokenizer, device):
     generator=None)
   # Will be used in generative perplexity calculation
   valid_loader.tokenizer = tokenizer
-  print("Valid loader created and valid tokenizer set is ready")
+  logger.info("Valid loader created and valid tokenizer set is ready")
 
   # --- Model, Optimizer, Scheduler ---
   model = Diffusion(config, tokenizer)
   
-  setup_distributed_model(model, config, local_rank)
+  setup_distributed_model(model, logger, config, local_rank)
 
   optimizer, scheduler = get_optimizer_and_scheduler(model, config)
 
@@ -493,7 +539,7 @@ def _train(config, logger, tokenizer, device):
   # --- Training Loop ---
   max_steps = config.trainer.max_steps
   training_complete = False
-  if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
+  if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
       model.sampling_eps_min = torch.tensor(config.training.sampling_eps_min)
       model.sampling_eps_max = torch.tensor(config.training.sampling_eps_max)
 
@@ -512,7 +558,7 @@ def _train(config, logger, tokenizer, device):
         attention_mask = batch['attention_mask'].to(local_rank)
 
         optimizer.zero_grad()
-        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
+        if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
             loss_obj = model.compute_loss(input_ids, attention_mask)
             if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
               sampling_eps_min = model.sampling_eps_min.item()
@@ -548,7 +594,7 @@ def _train(config, logger, tokenizer, device):
         optimizer.step()
         scheduler.step()
 
-        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
+        if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
             if model.ema:
                 model.ema.update(model.parameters())
         else:
