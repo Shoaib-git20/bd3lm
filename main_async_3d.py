@@ -111,12 +111,12 @@ def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: 
 
 def setup_fsdp_model(model, config, local_rank, mesh=None):
    # Debug: surface fsdp setup inputs
-    try:
-        _ws = dist.get_world_size()
-        _rk = dist.get_rank()
-    except Exception:
-        _ws = None
-        _rk = None
+    #try:
+    #    _ws = dist.get_world_size()
+    #    _rk = dist.get_rank()
+    #except Exception:
+    #    _ws = None
+    #    _rk = None
     #print(f"[Debug][FSDP setup] local_rank={local_rank} rank={_rk} world_size={_ws} mesh_provided={'yes' if mesh is not None else 'no'}")
     #print(f"[Debug][FSDP setup] requested sharding_strategy={getattr(config.strategy, 'sharding_strategy', None)} mixed_precision={config.strategy.get('mixed_precision', 'fp32')}")
    # Configure mixed precision
@@ -162,7 +162,6 @@ def setup_fsdp_model(model, config, local_rank, mesh=None):
             use_orig_params=True,
             device_mesh=mesh,
         )
-        return model
     else :
         model = FSDP(
             model,
@@ -185,65 +184,154 @@ def setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh
     # mesh = init_device_mesh(device_ids, mesh_shape)
     # Define parallelization rules for layers
     tp_layer_plan_patterns = {
-       "vocab_embed.embedding": "replicated",
-       "blocks.*.norm1": "sequence",
-       "blocks.*.norm2": "sequence",
-       "blocks.*.attn_qkv": "column",
-       "blocks.*.attn_out": "row",
-       "blocks.*.mlp.0": "column",
-       "blocks.*.mlp.2": "row",
-       "blocks.*.adaLN_modulation": "replicated",
-       "output_layer.norm_final": "sequence",
-       "output_layer.linear": "row",
+        "backbone.vocab_embed.embedding": "replicated",
+        "backbone.blocks.*.norm1": "sequence",
+        "backbone.blocks.*.norm2": "sequence",
+        "backbone.blocks.*.attn_qkv": "column",
+        "backbone.blocks.*.attn_out": "row",
+        "backbone.blocks.*.mlp.*0": "column",
+        "backbone.blocks.*.mlp.*2": "row",
+        "backbone.blocks.*.adaLN_modulation": "replicated",
+        "backbone.output_layer.norm_final": "sequence",
+        "backbone.output_layer.linear": "row",
+        "backbone.blocks.*": "replicated",
     }
-    def _pattern_to_regex(pattern: str):
-        # Escape dots and other chars, convert '*' to '.*'
-        # e.g. "blocks.*.attn_qkv" -> ^blocks\..*\.attn_qkv$
-        esc = re.escape(pattern)
-        regex = "^" + esc.replace(r"\*", ".*") + "$"
-        return re.compile(regex)
-    # Create list of compiled patterns
-    compiled_patterns = [(repl, _pattern_to_regex(pat)) for pat, repl in tp_layer_plan_patterns.items()]
-    def build_parallelize_plan(model):
-        """
-        Return dict mapping module FQN -> ParallelStyle() (ColwiseParallel/RowwiseParallel)
-        Only include modules that match patterns and have a parallel style (i.e., skip 'replicated').
-        """
-        plan = {}
-        for name, module in model.named_modules():
-            # try matching each pattern; the first matching pattern will apply
-            for parallel_style, cre in compiled_patterns:
-                if cre.match(name):
-                    if parallel_style == "column":
-                        plan[name] = ColwiseParallel()
-                    elif parallel_style == "row":
-                        plan[name] = RowwiseParallel()
-                    elif parallel_style == "sequence":
-                        plan[name] = SequenceParallel()
-                    # Skip 'replicated' style as it doesn't need explicit parallelization
-                    break
-        return plan
+
     # Build the plan using the actual model instance
     # Note: ensure 'model' is defined above this snippet (your instantiated DIT model)
-    parallelize_plan = build_parallelize_plan(model)
-    # Debug print the plan (for rank 0)
-    #if rank == 0:
-    #    print("Tensor Parallelize plan (FQN -> ParallelStyle):")
-    #    for k, v in parallelize_plan.items():
-    #        print(f"  {k} -> {v}")
+
+    # precompile regexes safely (escape dots, convert '*' -> '.*')
+    compiled_patterns = []
+    for pat, style in tp_layer_plan_patterns.items():
+        esc = re.escape(pat)
+        regex = "^" + esc.replace(r"\*", ".*") + "$"
+        compiled_patterns.append((re.compile(regex), style, pat))
+
+    parallelize_plan = {}
+    skipped = []
+
+    for name, module in model.named_modules():
+        if is_main_process():
+            print(f"[Debug][TP setup] Examining module: {name} ({type(module)})")
+        matched_any = False
+        for cre, style, pat in compiled_patterns:
+            if cre.match(name):
+                matched_any = True
+                # column/row require Linear or Embedding
+                if style in ("column", "row"):
+                    if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                        parallelize_plan[name] = ColwiseParallel() if style == "column" else RowwiseParallel()
+                    elif isinstance(module, torch.nn.Sequential):
+                        for child_name, child in module.named_children():
+                            full_name = f"{name}.{child_name}"
+                            if isinstance(child, torch.nn.Linear):
+                                if "mlp.0" in full_name:
+                                    parallelize_plan[full_name] = ColwiseParallel()
+                                elif "mlp.2" in full_name:
+                                    parallelize_plan[full_name] = RowwiseParallel()
+                    else:
+                        skipped.append((name, style, type(module).__name__, pat))
+                        if is_main_process():
+                            print(f"[TP planner] Skipping {name}: requested '{style}' but module is {type(module).__name__} (pattern={pat})")
+                elif style == "sequence":
+                    # accept if name includes 'norm' or module looks like LayerNorm (or custom norm)
+                    if "norm" in name.lower() or "norm" in module.__class__.__name__.lower() or isinstance(module, torch.nn.LayerNorm):
+                        parallelize_plan[name] = SequenceParallel()
+                    else:
+                        skipped.append((name, style, type(module).__name__, pat))
+                        if is_main_process():
+                            print(f"[TP planner] Skipping {name}: requested 'sequence' but module is {type(module).__name__} (pattern={pat})")
+                else:
+                    # 'replicated' -> intentionally no entry (kept replicated)
+                    if is_main_process():
+                        print(f"[TP planner] {name} set to 'replicated' by pattern {pat}")
+                break  # stop checking other patterns after first match
+        # optional: track names that matched no pattern
+        if not matched_any:
+            if is_main_process():
+                print(f"[TP planner] No pattern matched for {name}")
+    # summary
+    # TEMP DEBUG: check Colwise/Rowwise targets before calling parallelize_module
+    #if is_main_process():
+    #    module_map = dict(model.named_modules())  # compute once
+    #    colrow_warnings = []  # (name, expected_style, actual_type)
+    #    colrow_valid = []     # (name, style, actual_type)
+#
+    #    for name, style in parallelize_plan.items():
+    #        # style is an instance of ParallelStyle (ColwiseParallel, RowwiseParallel, SequenceParallel, ...)
+    #        if isinstance(style, (ColwiseParallel, RowwiseParallel)):
+    #            module = module_map.get(name)
+    #            if module is None:
+    #                colrow_warnings.append((name, style.__class__.__name__, "NOT FOUND"))
+    #            else:
+    #                # strict check first
+    #                if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+    #                    colrow_valid.append((name, style.__class__.__name__, module.__class__.__name__))
+    #                else:
+    #                    # broadened "linear-like" heuristic: subclass or custom wrapper
+    #                    cls_name = module.__class__.__name__.lower()
+    #                    if "linear" in cls_name or "embedding" in cls_name:
+    #                        colrow_valid.append((name, style.__class__.__name__, module.__class__.__name__ + " (linear-like)"))
+    #                    else:
+    #                        colrow_warnings.append((name, style.__class__.__name__, module.__class__.__name__))
+#
+    #    # Print results
+    #    if colrow_valid:
+    #        print("[TP check] Colwise/Rowwise valid targets:")
+    #        for n, s, t in colrow_valid:
+    #            print(f"  {n} -> {s} (module type: {t})")
+    #    else:
+    #        print("[TP check] No Colwise/Rowwise valid targets found.")
+#
+    #    if colrow_warnings:
+    #        print("[TP check][WARN] Colwise/Rowwise targets with issues:")
+    #        for n, s, t in colrow_warnings:
+    #            print(f"  {n} -> {s} (module type: {t})")
+    #    else:
+    #        print("[TP check] No warnings for Colwise/Rowwise targets.")
+
+
     # ---------- 5) Apply parallelize_module ----------
     # This will transform parameters into DTensor and shard weights according to the plan.
     # It must be called on all ranks.
     # The src_data_rank argument defaults to 0 (rank that has the data if needed); we keep default here.
-    try:
-        parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=parallelize_plan)
+    # run this BEFORE calling parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=parallelize_plan)
+    if is_main_process():
+        print("Tensor Parallelize plan (FQN -> ParallelStyle):")
+        for k, v in parallelize_plan.items():
+            print(f"  {k} -> {v}")
+
+    from torch.distributed.tensor.parallel.api import parallelize_module as _parallelize_module
+    import traceback
+
+    if is_main_process():
+        print("[TP debug] Starting per-mapping check...")
+
+    bad = []
+    for fname, style in list(parallelize_plan.items()):
+        small_plan = {fname: style}
+        try:
+            # Apply only this single mapping to a fresh copy of the model structure.
+            # IMPORTANT: we apply in-place to the real model but with a single-plan so we can localize failures.
+            if is_main_process():    
+                print(f"[TP debug] Testing mapping {fname} -> {style.__class__.__name__}")
+            _parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=small_plan)
+            if is_main_process():
+                print(f"[TP debug] OK: {fname}")
+        except NotImplementedError as e:
+            if is_main_process():
+                print(f"[TP debug][ERROR] Mapping failed for {fname}: {e}")
+            bad.append(fname)
+        except Exception as e:
+            if is_main_process():
+                print(f"[TP debug][ERROR] Unexpected error for {fname}: {type(e).__name__}: {e}")
+                traceback.print_exc()
+    if is_main_process():
+        print(f"[TP debug] Per-mapping check complete. {len(bad)} failing mappings: {bad}")
+    return model
+
+    model = parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=parallelize_plan)
         #print(f"[rank {rank}] parallelize_module done")
-    except Exception as e:
-        # If the API call fails (version mismatch), give a helpful message:
-        raise RuntimeError(
-            "parallelize_module failed. Make sure your PyTorch version supports torch.distributed.tensor.parallel "
-            "and DeviceMesh (PyTorch >= 2.3 / 2.4 recommended). Original error: " + str(e)
-        )
     return model
    
 
@@ -366,20 +454,25 @@ def setup_distributed_model(model, logger, config, local_rank):
 
         model = model.to(device)
         #logger.info(f"[Debug][3D] Setting up Tensor Parallel model...")
-        model_tp = setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh=tp_mesh)
+        model = setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh=tp_mesh)
+        print(f"Model type after tp setup: {type(model)}")
+        torch.cuda.synchronize()
         logger.info(f"[Debug][3D] TP model setup complete.")
 
         # apply FSDP inter-host on dp_mesh
         #logger.info(f"[Debug][3D] Setting up FSDP with DP mesh = {dp_mesh}...")
-        model_tp = setup_fsdp_model(model_tp, config, local_rank, mesh=dp_mesh)
+        model = setup_fsdp_model(model, config, local_rank, mesh=dp_mesh)
+        print(f"Model type after fsdp setup: {type(model)}")
         logger.info(f"[Debug][3D] FSDP setup complete")
 
         try:
-            model_tp = torch.compile(model_tp)
+            model = torch.compile(model)
             #logger.info(f"[Debug][3D] Model compiled with torch.compile for async TP.")
         except Exception as e:
             logger.warning(f"[Warning] torch.compile(model) failed: {e}")
         logger.info(f"[Debug][3D] Model is now wrapped with 3D parallelism (TP + FSDP).")
+
+        return model
 
     elif strategy_name == "async_tp":
         # async tensor-parallel only (1 node, 2 GPUs per node)
@@ -503,8 +596,12 @@ def _train(config, logger, tokenizer, device):
 
   # --- Model, Optimizer, Scheduler ---
   model = Diffusion(config, tokenizer)
+
+  print(f"Model type before whole setup: {type(model)}")
   
-  setup_distributed_model(model, logger, config, local_rank)
+  model = setup_distributed_model(model, logger, config, local_rank)
+
+  print(f"Model type after whole setup: {type(model)}")
 
   optimizer, scheduler = get_optimizer_and_scheduler(model, config)
 
@@ -558,7 +655,7 @@ def _train(config, logger, tokenizer, device):
         attention_mask = batch['attention_mask'].to(local_rank)
 
         optimizer.zero_grad()
-        if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
+        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
             loss_obj = model.compute_loss(input_ids, attention_mask)
             if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
               sampling_eps_min = model.sampling_eps_min.item()
@@ -594,7 +691,7 @@ def _train(config, logger, tokenizer, device):
         optimizer.step()
         scheduler.step()
 
-        if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
+        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
             if model.ema:
                 model.ema.update(model.parameters())
         else:
