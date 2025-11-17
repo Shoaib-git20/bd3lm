@@ -14,6 +14,7 @@ import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Replicate
 
 try:
   from torch.nn.attention.flex_attention import flex_attention, create_block_mask
@@ -102,8 +103,21 @@ def get_bias_dropout_add_scale(training):
 
   return _bias_dropout_add
 
+# debug: print types/shapes of x, shift_msa, scale_msa on rank 0 only
+
+def _tinfo(t):
+    if isinstance(t, DTensor):
+        return f"DTensor shape={tuple(t.shape)} placements={getattr(t, 'placements', None)}"
+    elif isinstance(t, torch.Tensor):
+        return f"Tensor shape={tuple(t.shape)} dtype={t.dtype} device={t.device}"
+    else:
+        return f"Other type: {type(t)}"
+
+
+
 
 # function overload
+@torch.jit.ignore
 def modulate(x: torch.Tensor,
              shift: torch.Tensor,
              scale: torch.Tensor) -> torch.Tensor:
@@ -129,7 +143,7 @@ def bias_dropout_add_scale_fused_inference(
   return bias_dropout_add_scale(
     x, bias, scale, residual, prob, False)
 
-@torch.jit.script
+@torch.jit.ignore
 def modulate_fused(x: torch.Tensor,
                    shift: torch.Tensor,
                    scale: torch.Tensor) -> torch.Tensor:
@@ -269,8 +283,23 @@ class TimestepEmbedder(nn.Module):
     return embedding
 
   def forward(self, t):
-    t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-    t_emb = self.mlp(t_freq)
+    # Check if t is a DTensor
+    if isinstance(t, DTensor):
+        local_t = t.to_local()
+      
+        t_freq = self.timestep_embedding(local_t, self.frequency_embedding_size)
+        t_freq_dt = DTensor.from_local(
+            t_freq,
+            t.device_mesh,
+            t.placements
+        )
+        
+        # 4. Pass the DTensor to the MLP
+        t_emb = self.mlp(t_freq_dt)
+    else:
+        # Standard (non-distributed) execution path
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
     return t_emb
 
 
@@ -625,12 +654,11 @@ class DDiTBlock(nn.Module):
 class EmbeddingLayer(nn.Module):
   def __init__(self, dim, vocab_dim):
     super().__init__()
-    self.embedding = nn.Parameter(torch.empty((vocab_dim, dim)))
-    torch.nn.init.kaiming_uniform_(self.embedding, a=math.sqrt(5))
+    self.embedding = nn.Embedding(vocab_dim, dim)
+    torch.nn.init.kaiming_uniform_(self.embedding.weight, a=math.sqrt(5))
 
   def forward(self, x):
-    return self.embedding[x]
-
+    return self.embedding(x)
 
 class DDiTFinalLayer(nn.Module):
   def __init__(self, hidden_size, out_channels, cond_dim, 
@@ -696,7 +724,6 @@ class DDiTFinalLayer(nn.Module):
 
       x = self.linear(x)
       return x
-
 
 class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
   def __init__(self, config, vocab_size: int):

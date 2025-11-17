@@ -1,7 +1,7 @@
 train: openwebtext-train
 valid: openwebtext-valid
 tokenizer_name_or_path: gpt2
-cache_dir: /fs/ess/PZS0622/shoaib/.cache/huggingface/datasets/data
+cache_dir: /work/hdd/bbiy/smohammad1/.cache/huggingface/datasets/data
 wrap: True
 streaming: False
 insert_train_eos: True

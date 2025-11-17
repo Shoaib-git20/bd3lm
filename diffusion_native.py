@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import models
 import noise_schedule
@@ -235,7 +236,27 @@ class Diffusion(torch.nn.Module):
   def _resample_q_xt(
       self, x, xt, move_indices, p, block_size, sampling_eps_min, sampling_eps_max):
     """Resamples x_t if the percentage of masked tokens is outside the bounds."""
-    perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
+    # Check if we are in Distributed Mode
+    is_dtensor = isinstance(x, DTensor)
+
+    # 1. Work with Local Tensors to avoid DTensor indexing issues
+    if is_dtensor:
+        local_xt = xt.to_local()
+        local_x = x.to_local()
+        local_move_indices = move_indices.to_local()
+        local_p = p.to_local()
+    else:
+        local_xt = xt
+        local_x = x
+        local_move_indices = move_indices
+        local_p = p
+
+    # 2. Perform Logic on Local Tensors
+    mask_val = self.mask_index
+    if isinstance(mask_val, torch.Tensor):
+        mask_val = mask_val.item()
+        
+    perc_masked = (local_xt == mask_val).float().sum(-1) / block_size
     while (perc_masked < sampling_eps_min).any() or (perc_masked > sampling_eps_max).any():
       if sampling_eps_min == 1e-3 and sampling_eps_max != 1:
         regen_idx = (perc_masked > sampling_eps_max)
@@ -249,10 +270,18 @@ class Diffusion(torch.nn.Module):
           break
       
       regen_idx = regen_idx.repeat_interleave(block_size,dim=-1)
-      move_indices[regen_idx] = (torch.rand(*x.shape, device=x.device) < p)[regen_idx]
-      xt = torch.where(move_indices, self.mask_index, x)
-      xt = xt.reshape(xt.shape[0], -1, block_size)
-      perc_masked = (xt == self.mask_index).float().sum(-1) / block_size
+      local_move_indices[regen_idx] = (torch.rand(*local_x.shape, device=local_x.device) < local_p)[regen_idx]
+      local_xt = torch.where(local_move_indices, mask_val, local_x)
+      local_xt = local_xt.reshape(local_xt.shape[0], -1, block_size)
+      perc_masked = (local_xt == mask_val).float().sum(-1) / block_size
+
+    # 3. Re-Wrap results into DTensor if necessary
+    if is_dtensor:
+      local_xt = local_xt.reshape(local_xt.shape[0], -1) # Flatten back to match original shape
+      # Create new DTensors with updated data, We use the mesh/placements from the original 'x'
+      xt = DTensor.from_local(local_xt, x.device_mesh, x.placements)
+    else:
+      xt = local_xt.reshape(local_xt.shape[0], -1)
     return xt
   
   def q_xt(
@@ -260,9 +289,24 @@ class Diffusion(torch.nn.Module):
     """Computes the noisy sample xt."""
     if block_size is None:
       block_size = self.block_size
-  
-    move_indices = torch.rand(*x.shape, device=x.device) <= p
-    xt = torch.where(move_indices, self.mask_index, x)
+    if isinstance(x, DTensor):
+        local_x = x.to_local()
+        local_p = p.to_local()
+        move_indices_local = torch.rand(*local_x.shape, device=local_x.device) <= local_p
+        
+        move_indices = DTensor.from_local(
+            move_indices_local,
+            x.device_mesh,
+            x.placements
+        )
+    else:
+        move_indices = torch.rand(*x.shape, device=x.device) <= p
+
+    mask_val = self.mask_index
+    if isinstance(mask_val, torch.Tensor):
+        mask_val = mask_val.item()
+
+    xt = torch.where(move_indices, mask_val, x)
 
     if block_size == 1 and sampling_eps_min == 1.0:
       return torch.full_like(x, self.mask_index)
@@ -514,6 +558,8 @@ class Diffusion(torch.nn.Module):
       t = self._sample_t(x0.shape, x0.device, sampling_eps_min, sampling_eps_max)
 
     loss_scale, p = self.noise(t)
+
+    dp_rank, local_bs = None, None
     sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
     dsigma = - loss_scale * torch.expm1(sigma)
 
@@ -521,6 +567,33 @@ class Diffusion(torch.nn.Module):
       sigma, dsigma = self.noise.total_noise(t), self.noise.rate_noise(t)
       p = 1 - torch.exp(-sigma)
       loss_scale = - (dsigma / torch.expm1(sigma))
+
+    # --- sigma and p convert to DTensor ---
+    if isinstance(x0, DTensor):
+        local_x = x0.to_local()
+        local_sigma = sigma
+        # --- Convert 'sigma' ---
+        if sigma.shape[0] != local_x.shape[0]:
+            dp_rank = x0.device_mesh.get_local_rank(mesh_dim=0)
+            local_bs = local_x.shape[0]
+            start, end = dp_rank * local_bs, (dp_rank + 1) * local_bs
+            local_sigma = sigma[start:end]
+
+        local_sigma = local_sigma.to(x0.device_mesh.device_type)
+        
+        sigma = DTensor.from_local(
+            local_sigma, x0.device_mesh, [Shard(0), Replicate()]
+        )
+        # --- Convert 'p' ---
+        local_p = p
+        if p.shape[0] != local_x.shape[0]:
+            local_p = p[start:end]
+            
+        local_p = local_p.to(x0.device_mesh.device_type)
+        
+        p = DTensor.from_local(
+            local_p, x0.device_mesh, [Shard(0), Replicate()]
+        )
 
     xt = self.q_xt(x0, p, sampling_eps_min=sampling_eps_min, sampling_eps_max=sampling_eps_max)
     if sampling_eps_min is not None and sampling_eps_min > 0.5:

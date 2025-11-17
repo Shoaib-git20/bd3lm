@@ -17,5 +17,5 @@ rich==13.7.1
 scikit-learn==1.5.1
 timm==0.9.16
 transformers==4.49.0
-triton==3.3.1
+triton
 wandb==0.19.8
