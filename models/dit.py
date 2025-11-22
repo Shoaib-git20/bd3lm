@@ -836,10 +836,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           mask = mask[
             self.n:self.n+x.shape[1], self.n:self.n+x.shape[1]]
           rotary_cos_sin = self.rotary_emb(x)
-
       else:
         rotary_cos_sin = self.rotary_emb(x[:, :self.n])
-
     else:
       rotary_cos_sin = self.rotary_emb(x)
       mask = None

@@ -246,14 +246,9 @@ def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
         # final norm: run on sequence-sharded slices and return local output
         "backbone.output_layer.norm_final": SequenceParallel(sequence_dim=1, use_local_output=True),
 
-        "backbone.sigma_map.mlp.0": ColwiseParallel(
-            input_layouts=(Shard(0), Replicate()), output_layouts=(Shard(0), Shard(-1)), use_local_output=False),
+        "backbone.sigma_map.mlp.0": SequenceParallel(sequence_dim=1, use_local_output=False),
         # The output (t_cond) must be replicated for AdaLN, so use RowwiseParallel last
-        "backbone.sigma_map.mlp.2": RowwiseParallel(
-            input_layouts=(Shard(0), Shard(-1)),
-            output_layouts=(Shard(0), Replicate()),
-            use_local_output=False  # Pass DTensor to other modules
-        ),
+        "backbone.sigma_map.mlp.2": SequenceParallel(sequence_dim=1, use_local_output=False),
     }
 
     n_blocks = len(model.backbone.blocks)
@@ -267,7 +262,13 @@ def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
         tp_plan[f"{p}.adaLN_modulation"] = SequenceParallel(sequence_dim=1, use_local_output=False)
 
         # attention qkv: assume sequence is sharded, project features (colwise on feature dim)
-        tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(use_local_output=False)
+        tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(
+            input_layouts=Shard(1),
+            output_layouts=Shard(-1),
+            use_local_output=False,
+        )
+
+        #tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=(Shard(1),Replicate()),use_local_output=False)
         tp_plan[f"{p}.attn_out"] = RowwiseParallel(output_layouts=Shard(1), use_local_output=False)
 
         # MLP: use dot notation mlp.0 and mlp.2 (not mlp[0])
