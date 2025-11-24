@@ -262,11 +262,7 @@ def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
         tp_plan[f"{p}.adaLN_modulation"] = SequenceParallel(sequence_dim=1, use_local_output=False)
 
         # attention qkv: assume sequence is sharded, project features (colwise on feature dim)
-        tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(
-            input_layouts=Shard(1),
-            output_layouts=Shard(-1),
-            use_local_output=False,
-        )
+        tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=Shard(1),output_layouts=Shard(-1),use_local_output=False)
 
         #tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=(Shard(1),Replicate()),use_local_output=False)
         tp_plan[f"{p}.attn_out"] = RowwiseParallel(output_layouts=Shard(1), use_local_output=False)
@@ -274,8 +270,6 @@ def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
         # MLP: use dot notation mlp.0 and mlp.2 (not mlp[0])
         tp_plan[f"{p}.mlp.0"] = ColwiseParallel(use_local_output=False)
         tp_plan[f"{p}.mlp.2"] = RowwiseParallel(output_layouts=Shard(1) , use_local_output=False)
-
-
 
     if is_main_process():
         print("Tensor Parallelize plan (FQN -> ParallelStyle):")

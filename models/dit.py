@@ -625,6 +625,9 @@ class DDiTBlock(nn.Module):
 
     # get qkvs
     if mask is not None and not sample_mode:
+      local_x = x.to_local()
+      local_x = local_x[:, :self.n]
+      x = DTensor.from_local(local_x, x.device_mesh, x.placements)
       qkv_x = self.get_qkv(x[:,:self.n], rotary_cos_sin)
       qkv_x0 = self.get_qkv(x[:,self.n:], rotary_cos_sin)
       qkv = torch.cat((qkv_x, qkv_x0), dim=1)
