@@ -14,7 +14,7 @@ import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 try:
   from torch.nn.attention.flex_attention import flex_attention, create_block_mask
@@ -74,7 +74,7 @@ def block_diff_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
   # **4. Combine Masks **
   return block_diagonal | offset_block_causal | block_causal
 
-@torch.compile(mode="default")
+@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(q, k, v, mask=None):
     return flex_attention(q, k, v, block_mask=mask)
 
@@ -103,24 +103,19 @@ def get_bias_dropout_add_scale(training):
 
   return _bias_dropout_add
 
-# debug: print types/shapes of x, shift_msa, scale_msa on rank 0 only
-
-def _tinfo(t):
-    if isinstance(t, DTensor):
-        return f"DTensor shape={tuple(t.shape)} placements={getattr(t, 'placements', None)}"
-    elif isinstance(t, torch.Tensor):
-        return f"Tensor shape={tuple(t.shape)} dtype={t.dtype} device={t.device}"
-    else:
-        return f"Other type: {type(t)}"
-
-
-
 
 # function overload
-@torch.jit.ignore
 def modulate(x: torch.Tensor,
              shift: torch.Tensor,
              scale: torch.Tensor) -> torch.Tensor:
+  if isinstance(x, DTensor):
+    x_local = x.to_local()
+    shift_local = shift.to_local() if isinstance(shift, DTensor) else shift
+    scale_local = scale.to_local() if isinstance(scale, DTensor) else scale
+    
+    out_local = x_local * (1 + scale_local) + shift_local
+    
+    return DTensor.from_local(out_local, x.device_mesh, x.placements)
   return x * (1 + scale) + shift
 
 @torch.jit.script
@@ -143,7 +138,7 @@ def bias_dropout_add_scale_fused_inference(
   return bias_dropout_add_scale(
     x, bias, scale, residual, prob, False)
 
-@torch.jit.ignore
+#@torch.jit.script
 def modulate_fused(x: torch.Tensor,
                    shift: torch.Tensor,
                    scale: torch.Tensor) -> torch.Tensor:
@@ -155,15 +150,15 @@ class Rotary(torch.nn.Module):
     super().__init__()
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
     self.register_buffer('inv_freq', inv_freq)
-    self.seq_len_cached = 0
+    self.seq_len_cached = None
     self.cos_cached = None
     self.sin_cached = None
 
-  def forward(self, x, seq_dim=1):
+  def forward(self, x, seq_dim=1, offset=0):
     seq_len = x.shape[seq_dim]
-    if seq_len > self.seq_len_cached:
+    if seq_len != self.seq_len_cached or offset > 0:
       self.seq_len_cached = seq_len
-      t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
+      t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq) + offset
       freqs = torch.einsum("i,j->ij", t, self.inv_freq.clone())
       emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
       # dims are: batch, seq_len, qkv, head, dim
@@ -173,21 +168,20 @@ class Rotary(torch.nn.Module):
       self.cos_cached[:,:,2,:,:].fill_(1.)
       self.sin_cached[:,:,2,:,:].fill_(0.)
 
-    cos = self.cos_cached[:, :seq_len, ...]
-    sin = self.sin_cached[:, :seq_len, ...]
-
-    # 3. DTensor Handling (Crucial for your 3D setup)
-    # If the input x is a DTensor, the RoPE embeddings MUST also be DTensors (Replicated).
     if isinstance(x, DTensor):
-        # We must ensure cos/sin are DTensors.
-        # Optimization: Check if they are already DTensors (from previous forward pass)
-        # If not (or if we just rebuilt the cache as local tensors), convert them.
-        if not isinstance(cos, DTensor):
-            global_replicate = [Replicate()] * x.device_mesh.ndim
-            cos = DTensor.from_local(cos, x.device_mesh, global_replicate)
-            sin = DTensor.from_local(sin, x.device_mesh, global_replicate)
+      if not isinstance(self.cos_cached, DTensor):
+        self.cos_cached = distribute_tensor(
+            self.cos_cached, 
+            device_mesh=x.device_mesh, 
+            placements=[Replicate()] * x.device_mesh.ndim
+        )
+        self.sin_cached = distribute_tensor(
+            self.sin_cached, 
+            device_mesh=x.device_mesh, 
+            placements=[Replicate()] * x.device_mesh.ndim
+        )
 
-    return cos, sin
+    return self.cos_cached, self.sin_cached
 
 
 def rotate_half(x):
@@ -211,7 +205,7 @@ def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
   return q, k, v
 
 def apply_rotary_pos_emb_torchscript(qkv, cos, sin):
-    return (qkv * cos) + (rotate_half(qkv) * sin)
+  return (qkv * cos) + (rotate_half(qkv) * sin)
 
 def apply_rotary_pos_emb(qkv, cos, sin):
   cos = cos[0,:,0,0,:cos.shape[-1]//2]
@@ -246,6 +240,7 @@ class LayerNorm(nn.Module):
     with torch.amp.autocast('cuda', enabled=False):
       x = F.layer_norm(x.float(), [self.dim])
     return x * self.weight[None, None, :]
+
 
 def residual_linear(x, W, x_skip, residual_scale):
   """x_skip + residual_scale * W @ x"""
@@ -288,6 +283,12 @@ class TimestepEmbedder(nn.Module):
       - math.log(max_period)
       * torch.arange(start=0, end=half).to(t.dtype).to(t.device)
       / half)
+    if isinstance(t, DTensor):
+      freqs = distribute_tensor(
+          freqs,
+          device_mesh=t.device_mesh, 
+          placements=[Replicate()] * t.device_mesh.ndim
+      )
     args = t[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:
@@ -297,25 +298,9 @@ class TimestepEmbedder(nn.Module):
     return embedding
 
   def forward(self, t):
-    # Check if t is a DTensor
-    if isinstance(t, DTensor):
-        local_t = t.to_local()
-      
-        t_freq = self.timestep_embedding(local_t, self.frequency_embedding_size)
-        t_freq_dt = DTensor.from_local(
-            t_freq,
-            t.device_mesh,
-            t.placements
-        )
-        
-        # 4. Pass the DTensor to the MLP
-        t_emb = self.mlp(t_freq_dt)
-    else:
-        # Standard (non-distributed) execution path
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
+    t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+    t_emb = self.mlp(t_freq)
     return t_emb
-
 
 class LabelEmbedder(nn.Module):
   """Embeds class labels into vector representations.
@@ -364,8 +349,6 @@ class DDiTBlockCausal(nn.Module):
       self.adaLN_modulation.bias.data.zero_()
     self.attn_backend = attn_backend
     self.kv_cache = None
-    self.cond_dim = cond_dim
-    self.hidden_size = dim
 
   def _get_bias_dropout_scale(self):
     if self.training:
@@ -435,19 +418,10 @@ class DDiTBlockCausal(nn.Module):
       scale_mlp, gate_mlp) = rearrange(
         self.adaLN_modulation(c), '(b h) d -> b h d', b=batch_size
         ).chunk(6, dim=-1)
-    else:
-      dummy_c = torch.zeros(x.shape, self.cond_dim, device=x.device, dtype=x.dtype)
-      _ = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
-      shift_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-      scale_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-      gate_msa = torch.ones(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-      shift_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-      scale_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-      gate_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
 
     # attention operation
     x_skip = x
-    if self.adaLN:
+    if c is not None:
       x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
     else:
       x = self.norm1(x)
@@ -464,7 +438,7 @@ class DDiTBlockCausal(nn.Module):
     else:
       x = self.cross_attn(qkv, c)
       
-    if self.adaLN:
+    if c is not None:
       x = bias_dropout_scale_fn(self.attn_out(x),
         None,
         gate_msa,
@@ -483,6 +457,125 @@ class DDiTBlockCausal(nn.Module):
         self.mlp(self.norm2(x)), None, scale, x, self.dropout)
     return x
 
+class DiTAttention(nn.Module):
+    def __init__(self,  n, block_size, dim, n_heads, attn_backend='flash_attn'):
+      super().__init__()
+      self.n_heads = n_heads
+      self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
+      self.attn_out = nn.Linear(dim, dim, bias=False)
+      self.block_size = block_size
+      self.attn_backend = attn_backend
+      self.n = n
+
+    def get_qkv(self, x, rotary_cos_sin, store_kv=False, kv_cache=None, cache_idx=0):
+    # compute qkv (potentially use cache)
+      if isinstance(x, DTensor):
+          x_in = x.redistribute(placements=[Shard(0), Replicate()])
+      else:
+          x_in = x
+
+      if kv_cache is not None:
+        new_qkv = self.attn_qkv(x_in)
+
+        if isinstance(new_qkv, DTensor):
+          new_qkv = new_qkv.to_local()
+
+        kv_cache[:, cache_idx:cache_idx+self.block_size] = new_qkv
+        qkv = kv_cache[:, :cache_idx+self.block_size].clone()
+      else:
+        qkv = self.attn_qkv(x_in)
+        if isinstance(qkv, DTensor):
+          qkv = qkv.to_local()
+      
+      total_local_dim = qkv.shape[-1]
+      local_n_heads = (total_local_dim // 3) // self.head_dim
+
+      qkv = einops.rearrange(
+        qkv,
+        'b s (three h d) -> b s three h d',
+        three=3,
+        h=local_n_heads)
+      with torch.amp.autocast('cuda', enabled=False):
+        cos, sin = rotary_cos_sin
+        if self.attn_backend == 'flash_attn':
+          qkv = apply_rotary_pos_emb(
+            qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+        else:
+          qkv = apply_rotary_pos_emb_torchscript(
+            qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+      return qkv
+    
+    def cross_attn(self, qkv, mask=None):
+      scale = qkv.shape[-1]
+      qkv = qkv.transpose(1, 3)
+      mask = mask.bool() if mask is not None else None
+      x = F.scaled_dot_product_attention(
+        query=qkv[:, :, 0],
+        key=qkv[:, :, 1],
+        value=qkv[:, :, 2],
+        attn_mask=mask,
+        is_causal=False,
+        scale=1 / math.sqrt(scale))
+      x = x.transpose(1, 2)
+      x = rearrange(x, 'b s h d -> b s (h d)')
+      return x
+
+    def cross_attn_flex(self, qkv, mask=None):
+      local_n_heads = qkv.shape[3]
+
+      qkv = rearrange(qkv, 'b s three h d -> b h three s d', h=local_n_heads)
+      x = fused_flex_attention(
+        qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2], mask=mask)
+      x = rearrange(x, 'b h s d -> b s (h d)')
+      return x
+
+    def forward(self, x, rotary_cos_sin, mask=None, causal=False, sample_mode=False, store_kv=False, kv_cache=None, attn_backend='flash_attn', cache_idx=0):
+      B, S, C = x.shape
+      if mask is not None and not sample_mode:
+        qkv_x = self.get_qkv(x[:,:self.n], rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        qkv_x0 = self.get_qkv(x[:,self.n:], rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        qkv = torch.cat((qkv_x, qkv_x0), dim=1)
+      else:
+        qkv = self.get_qkv(x, rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+
+      if attn_backend == 'flash_attn' and mask is None:
+        qkv = einops.rearrange(qkv, 'b s ... -> (b s) ...')
+        cu_seqlens = torch.arange(
+          0, (B + 1) * S, step=S,
+          dtype=torch.int32, device=qkv.device)
+        x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
+          qkv, cu_seqlens, S, 0., causal=causal)
+        x = rearrange(x, '(b s) h d -> b s (h d)', b=B)     
+      elif attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
+        x = self.cross_attn_flex(qkv, mask=mask)
+      elif attn_backend == 'sdpa':
+        x = self.cross_attn(qkv, mask=mask)
+      else:
+        raise ValueError('Unknown attention backend')
+
+      if kv_cache is not None:
+        x = x[:, -self.block_size:]
+
+      x = self.attn_out(x)
+
+      return x
+
+class DiTFeedForward(nn.Module):
+    def __init__(self, dim, mlp_ratio, dropout):
+        super().__init__()
+        self.w1 = nn.Linear(dim, mlp_ratio * dim, bias=True)
+        self.act = nn.GELU(approximate='tanh')
+        self.w2 = nn.Linear(mlp_ratio * dim, dim, bias=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x input is REPLICATED (Full Sequence)
+        x = self.w1(x)
+        x = self.act(x)
+        x = self.w2(x)
+        x = self.dropout(x)
+        return x
+
 
 class DDiTBlock(nn.Module):
   def __init__(self, n, dim, n_heads, adaLN,
@@ -499,21 +592,15 @@ class DDiTBlock(nn.Module):
     self.block_size = block_size
 
     self.norm1 = LayerNorm(dim)
-    self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
-    self.attn_out = nn.Linear(dim, dim, bias=False)
+    self.atten = DiTAttention(n, block_size, dim, n_heads, attn_backend)
     self.dropout1 = nn.Dropout(dropout)
 
     self.norm2 = LayerNorm(dim)
-    self.mlp = nn.Sequential(
-      nn.Linear(dim, mlp_ratio * dim, bias=True),
-      nn.GELU(approximate='tanh'),
-      nn.Linear(mlp_ratio * dim, dim, bias=True))
+    self.mlp = DiTFeedForward(dim, mlp_ratio, dropout)
     self.dropout2 = nn.Dropout(dropout)
     self.dropout = dropout
     self.kv_cache = None
     self.cache_idx = 0
-    self.hidden_size = dim
-    self.cond_dim = cond_dim
 
     if self.adaLN:
       self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim)
@@ -527,245 +614,96 @@ class DDiTBlock(nn.Module):
     else:
       return bias_dropout_add_scale_fused_inference
 
-  @torch.compiler.disable
-  def get_qkv(self, x, rotary_cos_sin, store_kv=False):
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-
-    B, S, C = x.shape
+  def _run_local_layer(self, layer, x):
 
     if isinstance(x, DTensor):
-        global_replicate = [Replicate()] * x.device_mesh.ndim
-        
-        needs_redist = any(not isinstance(p, Replicate) for p in x.placements)
-        if needs_redist:
-             x = x.redistribute(x.device_mesh, global_replicate)
-
         x_local = x.to_local()
-        x_local_flat = x_local.view(-1, C)
-        x_2d = DTensor.from_local(x_local_flat, x.device_mesh, global_replicate)
-    else:
-        x_2d = x.view(-1, C)
-
-    if self.kv_cache is not None:
-      qkv_dtensor = F.linear(x_2d, self.attn_qkv.weight, self.attn_qkv.bias)
-      qkv_replicated = qkv_dtensor.redistribute(x.device_mesh, global_replicate)
-      qkv_local = qkv_replicated.to_local() 
-      qkv_local = qkv_local.view(B, S, -1)
-      
-      self.kv_cache[:, self.cache_idx:self.cache_idx+self.block_size] = qkv_local
-      qkv_local = self.kv_cache[:, :self.cache_idx+self.block_size].clone()
-    else:
-      qkv_dtensor = F.linear(x_2d, self.attn_qkv.weight, self.attn_qkv.bias)
-      qkv_replicated = qkv_dtensor.redistribute(x.device_mesh, global_replicate)
-      qkv_local = qkv_replicated.to_local()
-      qkv_local = qkv_local.view(B, S, -1)
-
-    qkv_local = einops.rearrange(
-      qkv_local,
-      'b s (three h d) -> b s three h d',
-      three=3,
-      h=self.n_heads)
-    with torch.amp.autocast('cuda', enabled=False):
-      cos, sin = rotary_cos_sin
-      if isinstance(cos, DTensor): cos = cos.to_local()
-      if isinstance(sin, DTensor): sin = sin.to_local()
-      seq_len = qkv_local.shape[1]
-      rope_len = cos.shape[1]
-      
-      if rope_len < seq_len:
-          repeat_factor = (seq_len // rope_len) + 1
-          cos = cos.repeat(1, repeat_factor, 1, 1, 1)[:, :seq_len, ...]
-          sin = sin.repeat(1, repeat_factor, 1, 1, 1)[:, :seq_len, ...]
-      elif rope_len > seq_len:
-          cos = cos[:, :seq_len, ...]
-          sin = sin[:, :seq_len, ...]
-
-      if self.attn_backend == 'flash_attn':
-        qkv_local = apply_rotary_pos_emb(
-          qkv_local, cos.to(qkv_local.dtype), sin.to(qkv_local.dtype))
-      else:
-        qkv_local = apply_rotary_pos_emb_torchscript(
-          qkv_local, cos.to(qkv_local.dtype), sin.to(qkv_local.dtype))
+        out_local = layer(x_local)
+        return DTensor.from_local(out_local, x.device_mesh, x.placements)
     
-    if isinstance(x, DTensor):
-        qkv = DTensor.from_local(qkv_local, x.device_mesh, global_replicate)
-    else:
-        qkv = qkv_local
+    return layer(x)
 
-    return qkv
-  
-  def attn_mlp(self, x, c, gate_msa, gate_mlp, shift_mlp, scale_mlp, x_skip):
+  def forward(self, x, rotary_cos_sin, c,
+              causal=False, mask=None, sample_mode=False, store_kv=False):
     
-    def run_mlp_robust(input_tensor):
-        B, S, C = input_tensor.shape
-        if isinstance(input_tensor, DTensor):
-            global_replicate = [Replicate()] * input_tensor.device_mesh.ndim
-            if any(not isinstance(p, Replicate) for p in input_tensor.placements):
-                 input_tensor = input_tensor.redistribute(input_tensor.device_mesh, global_replicate)
-            
-            x_local = input_tensor.to_local()
-            x_2d = x_local.view(-1, C)
-            x_2d_dt = DTensor.from_local(x_2d, input_tensor.device_mesh, global_replicate)
-        else:
-            x_2d_dt = input_tensor.view(-1, C)
-        w1 = self.mlp[0].weight
-        b1 = self.mlp[0].bias
-        h = F.linear(x_2d_dt, w1, b1)
-        h = self.mlp[1](h)
-        w2 = self.mlp[2].weight
-        b2 = self.mlp[2].bias
-        out = F.linear(h, w2, b2)
-        
-        if isinstance(out, DTensor):
-             if any(p.is_partial() for p in out.placements):
-                 out = out.redistribute(out.device_mesh, global_replicate)
-             
-             out_local = out.to_local()
-             out_local = out_local.view(B, S, -1)
-             
-             out_final = DTensor.from_local(out_local, out.device_mesh, global_replicate)
-        else:
-             out_final = out.view(B, S, -1)
-             
-        return out_final
-
-    bias_dropout_scale_fn = self._get_bias_dropout_scale()
-    
-    if self.adaLN:
-      x = bias_dropout_scale_fn(self.attn_out(x),
-        None,
-        gate_msa,
-        x_skip,
-        self.dropout)
-      mlp_input = modulate_fused(self.norm2(x), shift_mlp, scale_mlp)
-      
-      mlp_output = run_mlp_robust(mlp_input)
-      
-      x = bias_dropout_scale_fn(
-        mlp_output,
-        None, gate_mlp, x, self.dropout)
-    else:
-      scale = torch.ones(1, device=x.device, dtype=x.dtype)
-      x = bias_dropout_scale_fn(
-        self.attn_out(x), None, scale, x_skip, self.dropout)
-      
-      mlp_input = self.norm2(x)
-      mlp_output = run_mlp_robust(mlp_input)
-      
-      x = bias_dropout_scale_fn(
-        mlp_output, None, scale, x, self.dropout)
-        
-    return x
-
-  def cross_attn(self, qkv, mask=None):
-
-    mesh = qkv.device_mesh if hasattr(qkv, "device_mesh") else None
-    # 1. Unwrap
-    if hasattr(qkv, "to_local"):
-        qkv = qkv.to_local()
-
-    scale = qkv.shape[-1]
-    qkv = qkv.transpose(1, 3)
-    mask = mask.bool() if mask is not None else None
-    x = F.scaled_dot_product_attention(
-      query=qkv[:, :, 0],
-      key=qkv[:, :, 1],
-      value=qkv[:, :, 2],
-      attn_mask=mask,
-      is_causal=False,
-      scale=1 / math.sqrt(scale))
-    x = x.transpose(1, 2)
-    x = rearrange(x, 'b s h d -> b s (h d)')
-
-    if mesh is not None:
-      x = DTensor.from_local(x, mesh, [Replicate()] * mesh.ndim)
-    return x
-
-  def cross_attn_flex(self, qkv, mask=None):
-    mesh = qkv.device_mesh if hasattr(qkv, "device_mesh") else None
-    if hasattr(qkv, "to_local"):
-        qkv = qkv.to_local()
-
-    qkv = rearrange(qkv, 'b s three h d -> b h three s d', h=self.n_heads)
-    x = fused_flex_attention(
-      qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2], mask=mask)
-    x = rearrange(x, 'b h s d -> b s (h d)')
-
-    if mesh is not None:
-         x = DTensor.from_local(x, mesh, [Replicate()] * mesh.ndim)
-    return x
-
-  def forward(self,
-              x,
-              rotary_cos_sin,
-              c,
-              causal=False,
-              mask=None,
-              sample_mode=False,
-              store_kv=False):
     batch_size, seq_len = x.shape[0], x.shape[1]
 
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = None, None, None, None, None, None
-    if self.adaLN:
-      if c is not None and c.shape[0] == batch_size:
-        (shift_msa, scale_msa, gate_msa, shift_mlp,
-        scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
-      elif c is not None:
-        (shift_msa, scale_msa, gate_msa, shift_mlp,
-        scale_mlp, gate_mlp) = rearrange(
+
+    if c is not None and c.shape[0] == batch_size:
+      chunks = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
+    elif c is not None:
+      chunks = rearrange(
         self.adaLN_modulation(c), '(b h) d -> b h d', b=batch_size
         ).chunk(6, dim=-1)
-      else:
-        dummy_c = torch.zeros(x.shape, self.cond_dim, device=x.device, dtype=x.dtype)
-        _ = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
-        shift_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-        scale_msa = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-        gate_msa = torch.ones(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-        shift_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-        scale_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-        gate_mlp = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
+    
+    if isinstance(x, DTensor) and chunks is not None:
+      target_mesh = x.device_mesh
+      def to_dt(t):
+          if isinstance(t, DTensor) and t.device_mesh != target_mesh:
+              t = t.to_local()
+          
+          if isinstance(t, DTensor): 
+              return t
+          
+          if target_mesh.ndim == 2:
+              placements = [Shard(0), Replicate()]
+          else:
+              placements = [Replicate()] * target_mesh.ndim
+              
+          return DTensor.from_local(t, target_mesh, placements)
+      
+      chunks = tuple(map(to_dt, chunks))
+
+    if chunks is not None:
+      (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) = chunks
 
     x_skip = x
-    if self.adaLN:
+    #x_norm = self._run_local_layer(self.norm1, x)
+    if c is not None:
       x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
     else:
       x = self.norm1(x)
 
     # get qkvs
-    #if mask is not None and not sample_mode:
-    #  qkv_x = self.get_qkv(x[:,:self.n].clone(), rotary_cos_sin)
-    #  qkv_x0 = self.get_qkv(x[:,self.n:].clone(), rotary_cos_sin)
-    #  qkv = torch.cat((qkv_x, qkv_x0), dim=1)
-    #else:
-    #  qkv = self.get_qkv(x, rotary_cos_sin, store_kv=store_kv)
+    x = self.atten(
+        x,               
+        rotary_cos_sin=rotary_cos_sin,  
+        mask=mask,       
+        causal=causal,  
+        sample_mode=sample_mode,
+        store_kv=store_kv,      
+        attn_backend=self.attn_backend,
+        cache_idx=self.cache_idx
+    )
 
-    qkv = self.get_qkv(x.contiguous(), rotary_cos_sin, store_kv=store_kv)
-      
-    # attention
-    if self.attn_backend == 'flash_attn' and mask is None:
-      mesh = qkv.device_mesh if hasattr(qkv, "device_mesh") else None
-      if hasattr(qkv, "to_local"):
-          qkv = qkv.to_local()
-      qkv = einops.rearrange(qkv, 'b s ... -> (b s) ...')
-      cu_seqlens = torch.arange(
-        0, (batch_size + 1) * seq_len, step=seq_len,
-        dtype=torch.int32, device=qkv.device)
-      x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-        qkv, cu_seqlens, seq_len, 0., causal=causal)
-      x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
-      if mesh is not None:
-          x = DTensor.from_local(x, mesh, [Replicate()] * mesh.ndim)     
-    elif self.attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
-      x = self.cross_attn_flex(qkv, mask=mask)
-    elif self.attn_backend == 'sdpa':
-      x = self.cross_attn(qkv, mask=mask)
+    if store_kv:
+      self.cache_idx += self.block_size
+      if self.cache_idx >= self.max_seqlen:
+          self.cache_idx = self.max_seqlen - self.block_size
+          self.kv_cache[:, :-self.block_size] = self.kv_cache[:, self.block_size:].clone()
+
+    bias_dropout_scale_fn = self._get_bias_dropout_scale()
+
+    if c is not None:
+      x = bias_dropout_scale_fn(x,
+        None,
+        gate_msa,
+        x_skip,
+        self.dropout)
+      # mlp operation
+      x = bias_dropout_scale_fn(
+        self.mlp(modulate_fused(self.norm2(x), shift_mlp, scale_mlp)),
+        None, gate_mlp, x, self.dropout)
     else:
-      raise ValueError('Unknown attention backend')
-    if self.kv_cache is not None:
-      x = x[:, -self.block_size:]
-    x = self.attn_mlp(x, c, gate_msa, gate_mlp, shift_mlp, scale_mlp, x_skip)
+      scale = torch.ones(1, device=x.device, dtype=x.dtype)
+      x = bias_dropout_scale_fn(x, None, scale, x_skip, self.dropout)
+      x = bias_dropout_scale_fn(
+        self.mlp(self.norm2(x)), 
+        None, scale, x, self.dropout)
+
     return x
-   
+
 class EmbeddingLayer(nn.Module):
   def __init__(self, dim, vocab_dim):
     super().__init__()
@@ -784,11 +722,6 @@ class DDiTFinalLayer(nn.Module):
     self.linear.weight.data.zero_()
     self.linear.bias.data.zero_()
     self.adaLN = adaLN
-
-    # Store hidden_size and cond_dim for use in forward pass when creating dummy tensors
-    self.hidden_size = hidden_size
-    self.cond_dim = cond_dim
-
     if self.adaLN:
       self.adaLN_modulation = nn.Linear(cond_dim,
                                         2 * hidden_size,
@@ -798,66 +731,16 @@ class DDiTFinalLayer(nn.Module):
     self.tie_word_embeddings = tie_word_embeddings
 
   def forward(self, x, c):
-      def run_ada_robust(layer, input_tensor):
-          if isinstance(input_tensor, DTensor):
-              input_tensor = input_tensor.to_local()
-          # Compute locally using the local portion of the weight (which is the full weight for adaLN)
-          out = F.linear(input_tensor, layer.weight.to_local(), layer.bias.to_local())
-          return out
-
-      x = self.norm_final(x)
-      shift, scale = None, None # Initialize shift and scale
-      if self.adaLN: # Only proceed if adaLN_modulation was instantiated
-          if c is not None:
-              # Normal operation: Conditional context 'c' (t_cond) is provided.
-              # 'c' is typically (batch_size, cond_dim), and 'x' is (batch_size, seq_len, hidden_size).
-              # The output of adaLN_modulation(c) is (batch_size, 2 * hidden_size).
-              # [:, None] adds a sequence dimension: (batch_size, 1, 2 * hidden_size)
-              # chunk(2, dim=2) splits it into two (batch_size, 1, hidden_size) tensors.
-              if c.shape[0] == x.shape[0]:
-                ada_output = run_ada_robust(self.adaLN_modulation, c)
-                shift, scale = ada_output[:, None].chunk(2, dim=2)
-              else:
-                if isinstance(c, DTensor): c = c.to_local()
-                c_expanded = rearrange(c, '(b h) d -> b h d', b=x.shape[0])
-                ada_output = run_ada_robust(self.adaLN_modulation, c_expanded)
-                shift, scale = ada_output.chunk(2, dim=-1)
-          else:
-              # 'c' (t_cond) is None, which happens if self.parameterization == 'ar' in Diffusion.
-              # To satisfy FSDP requirements for a consistent computation graph,
-              # we must still call self.adaLN_modulation if it exists.
-              
-              # 1. Create a dummy tensor for 'c' to pass through adaLN_modulation.
-              # This ensures the forward pass of adaLN_modulation occurs.
-              dummy_c = torch.zeros(x.shape, self.cond_dim, device=x.device, dtype=x.dtype)
-              dummy_output = self.adaLN_modulation(dummy_c) # The output is computed but effectively discarded.
-              
-              # 2. Create zero-effect shift and scale tensors.
-              # For modulate_fused (x * (1 + scale) + shift), a no-op means shift=0 and scale=0.
-              # These tensors must match the shape of the actual shift/scale: (batch_size, 1, hidden_size).
-              shift = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-              scale = torch.zeros(x.shape, 1, self.hidden_size, device=x.device, dtype=x.dtype)
-
-              # 3. Add the zero-impact dependency to prevent dead-code elimination.
-              shift = shift + dummy_output.sum() * 0
-              scale = scale + dummy_output.sum() * 0
-
-      # Apply modulation if shift and scale were computed (i.e., if self.adaLN was True)
-      if shift is not None and scale is not None:
-          x = modulate_fused(x, shift, scale)
-      
-      mesh = self.linear.weight.device_mesh
-      x_dt = DTensor.from_local(x, mesh, [Replicate(), Shard(1)])
-      x_replicated = x_dt.redistribute(mesh, [Replicate(), Replicate()])
-      
-      w_local = self.linear.weight.to_local()
-      b_local = self.linear.bias.to_local() if self.linear.bias is not None else None
-      
-      logits_local = F.linear(x_replicated.to_local(), w_local, b_local)
-      
-      logits_dt = DTensor.from_local(logits_local, mesh, [Replicate(), Shard(-1)])
-      logits_full = logits_dt.redistribute(mesh, [Replicate(), Replicate()])
-      return logits_full.to_local()
+    x = self.norm_final(x)
+    if c is not None:
+      if c.shape[0] == x.shape[0]:
+        shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
+      else:
+        shift, scale = rearrange(
+          self.adaLN_modulation(c), '(b h) d -> b h d', b=x.shape[0]).chunk(2, dim=-1)
+      x = modulate_fused(x, shift, scale)
+    x = self.linear(x)
+    return x
 
 class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
   def __init__(self, config, vocab_size: int):
@@ -946,11 +829,35 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       block.cache_idx = 0
 
   def forward(self, indices, sigma, sample_mode=False, store_kv=False):
+    
     x = self.vocab_embed(indices)
+
     if sigma is None:
       t_cond = None
     else:
-      t_cond = F.silu(self.sigma_map(sigma))
+      if hasattr(self.sigma_map, 'mlp') and len(self.sigma_map.mlp) > 0:
+          ref_weight = self.sigma_map.mlp[0].weight
+      else:
+          ref_weight = next(self.sigma_map.parameters())
+
+      if isinstance(ref_weight, DTensor):
+          sigma_input = distribute_tensor(
+              sigma,
+              device_mesh=ref_weight.device_mesh,
+              placements=[Replicate()] * ref_weight.device_mesh.ndim
+          )
+      else:
+          sigma_input = sigma
+      
+      t_cond = F.silu(self.sigma_map(sigma_input))
+
+    x_is_seq_sharded = isinstance(x, DTensor) and x.placements[0].is_shard(dim=1)
+
+    if x_is_seq_sharded:
+        # Gather to full sequence for rotary/slicing logic
+        x_full = x.full_tensor()
+    else:
+        x_full = x
 
     cross_attn = hasattr(self, 'block_diff_mask')
     if cross_attn:
@@ -969,11 +876,13 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           # index block-causal mask only during sampling
           mask = mask[
             self.n:self.n+x.shape[1], self.n:self.n+x.shape[1]]
-          rotary_cos_sin = self.rotary_emb(x)
+          rotary_cos_sin = self.rotary_emb(x_full, offset=self.n)
+
       else:
-        rotary_cos_sin = self.rotary_emb(x[:, :self.n])
+        rotary_cos_sin = self.rotary_emb(x_full[:, :self.n])
+
     else:
-      rotary_cos_sin = self.rotary_emb(x)
+      rotary_cos_sin = self.rotary_emb(x_full)
       mask = None
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):

@@ -34,6 +34,7 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     SequenceParallel,
+    PrepareModuleInput,
 )
 
 from torch.distributed._symmetric_memory import enable_symm_mem_for_group
@@ -238,8 +239,8 @@ def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
             use_local_output=False,
         ),
         "backbone.output_layer.linear": ColwiseParallel(
-            input_layouts=(Shard(dim=1),),
-            output_layouts=(Replicate(),),
+            input_layouts=Replicate(),
+            output_layouts=Replicate(),
             use_local_output=True,   # ensure local tensor for loss / FSDP consumption
         ),
 
@@ -262,14 +263,14 @@ def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
         tp_plan[f"{p}.adaLN_modulation"] = SequenceParallel(sequence_dim=1, use_local_output=False)
 
         # attention qkv: assume sequence is sharded, project features (colwise on feature dim)
-        tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=Shard(1),output_layouts=Shard(-1),use_local_output=False)
+        tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=Replicate(),output_layouts=Shard(-1),use_local_output=False)
 
         #tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=(Shard(1),Replicate()),use_local_output=False)
-        tp_plan[f"{p}.attn_out"] = RowwiseParallel(output_layouts=Shard(1), use_local_output=False)
+        tp_plan[f"{p}.attn_out"] = RowwiseParallel(input_layouts=Shard(-1), output_layouts=Shard(1), use_local_output=False)
 
         # MLP: use dot notation mlp.0 and mlp.2 (not mlp[0])
-        tp_plan[f"{p}.mlp.0"] = ColwiseParallel(use_local_output=False)
-        tp_plan[f"{p}.mlp.2"] = RowwiseParallel(output_layouts=Shard(1) , use_local_output=False)
+        tp_plan[f"{p}.mlp.0"] = ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1), use_local_output=False)
+        tp_plan[f"{p}.mlp.2"] = RowwiseParallel(input_layouts=Shard(-1), output_layouts=Shard(1) , use_local_output=False)
 
     if is_main_process():
         print("Tensor Parallelize plan (FQN -> ParallelStyle):")
@@ -278,7 +279,91 @@ def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
 
     # call parallelize_module with explicit kwargs (safer)
     parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
+    torch.cuda.synchronize()
 
+    model = fully_shard(model, mesh=dp_mesh)
+
+    return model, dp_mesh, tp_mesh, mesh_2d
+
+def native_apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
+
+    device_type = torch.accelerator.current_accelerator().type
+    if is_main_process():
+        print(f"[Debug][3D] Initializing 2D device mesh with shape ({dp_size}, {tp_size})")
+    
+    mesh_2d = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+
+    if is_main_process():
+        print(f"[Debug][3D] Device mesh initialized: {mesh_2d}")
+
+    tp_mesh = mesh_2d["tp"]
+    dp_mesh = mesh_2d["dp"]
+
+    tp_plan = {
+        # --- Global Inputs ---
+        # 1. Vocab Embed: Output is Sequence Sharded (Memory Efficient)
+        "backbone.vocab_embed.embedding": RowwiseParallel(),
+
+        # --- The Output Block ---
+        # Final Norm runs on the local sequence shard
+        # "backbone.output_layer.norm_final": SequenceParallel(sequence_dim=1),
+
+        # Gather before final Linear projection
+        # "backbone.output_layer.linear": PrepareModuleInput(
+        #     input_layouts=Shard(1), 
+        #     desired_input_layouts=Replicate()
+        # ),
+        #"backbone.output_layer.linear": ColwiseParallel(
+        #    input_layouts=Replicate(),
+        #    output_layouts=Replicate()
+        #),
+    }
+
+    # --- Loop over DiT Blocks ---
+    n_blocks = len(model.backbone.blocks)
+    for i in range(n_blocks):
+        p = f"backbone.blocks.{i}"
+
+        # 1. Norms: Run locally on the sequence shard
+        # tp_plan[f"{p}.norm1"] = SequenceParallel(sequence_dim=1)
+        # tp_plan[f"{p}.norm2"] = SequenceParallel(sequence_dim=1)
+
+        # 3. Attention Block (Sandwich)
+        # tp_plan[f"{p}.atten"] = PrepareModuleInput(
+        #     input_layouts=(Shard(1),), 
+        #     desired_input_layouts=(Replicate(),), 
+        # )
+
+        #tp_plan[f"{p}.atten.attn_qkv"] = ColwiseParallel(
+        #    input_layouts=(Shard(0), Replicate()), 
+        #    output_layouts=(Shard(0), Shard(-1)), 
+        #    use_local_output=False
+        #)
+        #tp_plan[f"{p}.atten.attn_out"] = RowwiseParallel(
+        #    input_layouts=(Shard(0), Shard(-1)),
+        #    output_layouts=(Shard(0), Replicate()), 
+        #    use_local_output=False
+        #)
+
+        tp_plan[f"{p}.mlp.w1"] = ColwiseParallel(
+                input_layouts=(Shard(0), Replicate()),
+                output_layouts=(Shard(0), Shard(-1)),
+                use_local_output=False
+        )
+
+        tp_plan[f"{p}.mlp.w2"] = RowwiseParallel(
+            input_layouts=(Shard(0), Shard(-1)),
+            output_layouts=(Shard(0), Replicate()),
+            use_local_output=False
+        )
+
+    if is_main_process():
+        print("Tensor Parallelize plan (FQN -> ParallelStyle):")
+        for k, v in tp_plan.items():
+            print(f"  {k} -> {v}")
+
+    # call parallelize_module with explicit kwargs (safer)
+    parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
     torch.cuda.synchronize()
 
     model = fully_shard(model, mesh=dp_mesh)
@@ -357,11 +442,7 @@ def setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh
     #print(f"[Debug][TP setup] entering setup_tp_model: rank={rank} world_size={world_size} local_rank={local_rank} tp_size={tp_size}")
     if tp_mesh is None:
         tp_mesh = init_device_mesh("cuda", (tp_size,))
-    #print(f"[Debug][TP setup] DeviceMesh initialized with shape {(tp_size,)} -> {tp_mesh}")
-    # mesh_shape = (world_size,)
-    # device_ids = list(range(world_size))
-    # mesh = init_device_mesh(device_ids, mesh_shape)
-    # Define parallelization rules for layers
+
     tp_layer_plan_patterns = {
         "backbone.vocab_embed.embedding": "replicated",
         "backbone.blocks.*.norm1": "sequence",
@@ -739,6 +820,7 @@ def setup_distributed_model(model, logger, config, local_rank):
     else:
         raise ValueError(f"Unknown distributed strategy: {strategy_name}")
 
+@torch.compiler.disable
 def _train(config, logger, tokenizer, device):
   """Main distributed training loop."""
   rank = int(os.environ["RANK"])
@@ -767,7 +849,7 @@ def _train(config, logger, tokenizer, device):
     assert world_size % (tp_size) == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
     dp_size = world_size // (tp_size)
     model = model.to(device_type)
-    model, dp_mesh, tp_mesh, mesh_2d = apply_tp_fsdp_with_sp(model, config, tp_size, dp_size)
+    model, dp_mesh, tp_mesh, mesh_2d = native_apply_tp_fsdp_with_sp(model, config, tp_size, dp_size)
     torch.cuda.synchronize()
 
     dp_rank = dp_mesh.get_local_rank()
@@ -891,12 +973,9 @@ def _train(config, logger, tokenizer, device):
               loss = - output.gather(-1, output_tokens[:, :, None])[:, :, 0]
             else:
               loss = model._forward_pass_diffusion(
-                input_tokens,
-                sampling_eps_min=sampling_eps_min,
-                sampling_eps_max=sampling_eps_max)
-
+                        input_tokens, sampling_eps_min=sampling_eps_min, sampling_eps_max=sampling_eps_max)
             if model.ignore_bos and not model.training:
-              attention_mask[:, 0] = 0
+                attention_mask[:, 0] = 0
 
             nlls = (loss * attention_mask)
             token_nll = nlls.sum() / attention_mask.sum()

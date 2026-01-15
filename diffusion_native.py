@@ -25,6 +25,62 @@ def _unsqueeze(x, reference):
     *x.shape,
     *((1,) * (len(reference.shape) - len(x.shape))))
 
+class ToDTensorBarrier(torch.autograd.Function):
+    """
+    A strictly local-to-distributed boundary that safeguards gradients.
+    Forward: Wraps Local Tensor -> DTensor
+    Backward: Unwraps DTensor Grad -> Local Tensor Grad
+    """
+    @staticmethod
+    def forward(ctx, local_tensor, mesh, placements):
+        ctx.mesh = mesh
+        ctx.placements = placements
+        # Create DTensor from local
+        return DTensor.from_local(local_tensor, mesh, placements)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # grad_output is a DTensor (coming from the training loop).
+        # CRITICAL FIX: We explicitly unwrap the gradient to Local
+        # before letting it flow back into the local loss calculation.
+        if isinstance(grad_output, DTensor):
+            grad_local = grad_output.to_local()
+        else:
+            grad_local = grad_output
+            
+        # Return local gradient for input, None for mesh/placements
+        return grad_local, None, None
+
+@torch.compiler.disable
+def _compute_local_loss_eager(model_output, x0, loss_scale):
+  """
+  Forcefully unwraps inputs to local tensors, computes loss, 
+  and returns a local tensor.
+  """
+  if hasattr(model_output, "to_local"):
+      out_local = model_output.to_local()
+  else:
+      out_local = model_output
+      
+  if hasattr(x0, "to_local"):
+      x0_local = x0.to_local()
+  else:
+      x0_local = x0
+      
+  if hasattr(loss_scale, "to_local"):
+      scale_local = loss_scale.to_local()
+  else:
+      scale_local = loss_scale
+
+  log_p_theta = torch.gather(
+      input=out_local, 
+      dim=-1, 
+      index=x0_local[:, :, None]
+  ).squeeze(-1)
+  
+  loss_local = scale_local * log_p_theta
+  return loss_local
+
 @dataclass
 class Loss:
   loss: torch.FloatTensor
@@ -67,7 +123,7 @@ class Diffusion(torch.nn.Module):
       self.block_size = 1
 
     if self.config.algo.backbone == 'dit':
-      self.backbone = models.dit.DIT(
+      self.backbone = models.native_dit.DIT(
         self.config, vocab_size=self.vocab_size)
     elif self.config.algo.backbone == 'dimamba':
       self.backbone = models.dimamba.DiMamba(
@@ -181,9 +237,23 @@ class Diffusion(torch.nn.Module):
     return state_dict
 
   def _subs_parameterization(self, logits, xt):
+    if isinstance(xt, DTensor):
+        full_replicate = [Replicate()] * xt.device_mesh.ndim
+        if any(not isinstance(p, Replicate) for p in xt.placements):
+            xt = xt.redistribute(xt.device_mesh, full_replicate)
+        xt = xt.to_local()
+    if hasattr(self, 'mask_index') and self.mask_index >= logits.shape[-1]:
+        pad_amt = (self.mask_index - logits.shape[-1]) + 1
+        logits = torch.nn.functional.pad(logits, (0, pad_amt), value=self.neg_infinity)
+    logits = logits.clone()
+    
     logits[:, :, self.mask_index] += self.neg_infinity
     logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    
     unmasked_indices = (xt != self.mask_index)
+    if unmasked_indices.device != logits.device:
+        unmasked_indices = unmasked_indices.to(logits.device)
+
     logits[unmasked_indices] = self.neg_infinity
     logits[unmasked_indices, xt[unmasked_indices]] = 0
     return logits
@@ -224,6 +294,10 @@ class Diffusion(torch.nn.Module):
         logits = logits.log_softmax(-1)
       else:
         logits = self.backbone(x, sigma)
+    
+    if hasattr(self, 'mask_index') and self.mask_index >= logits.shape[-1]:
+        pad_amt = (self.mask_index - logits.shape[-1]) + 1
+        logits = torch.nn.functional.pad(logits, (0, pad_amt), value=self.neg_infinity)
 
     if self.cross_attn:
       x = x[:, :self.config.model.length]
@@ -244,12 +318,10 @@ class Diffusion(torch.nn.Module):
         local_xt = xt.to_local()
         local_x = x.to_local()
         local_move_indices = move_indices.to_local()
-        local_p = p.to_local()
     else:
         local_xt = xt
         local_x = x
         local_move_indices = move_indices
-        local_p = p
 
     # 2. Perform Logic on Local Tensors
     mask_val = self.mask_index
@@ -270,7 +342,7 @@ class Diffusion(torch.nn.Module):
           break
       
       regen_idx = regen_idx.repeat_interleave(block_size,dim=-1)
-      local_move_indices[regen_idx] = (torch.rand(*local_x.shape, device=local_x.device) < local_p)[regen_idx]
+      local_move_indices[regen_idx] = (torch.rand(*local_x.shape, device=local_x.device) < p)[regen_idx]
       local_xt = torch.where(local_move_indices, mask_val, local_x)
       local_xt = local_xt.reshape(local_xt.shape[0], -1, block_size)
       perc_masked = (local_xt == mask_val).float().sum(-1) / block_size
@@ -291,7 +363,7 @@ class Diffusion(torch.nn.Module):
       block_size = self.block_size
     if isinstance(x, DTensor):
         local_x = x.to_local()
-        local_p = p.to_local()
+        local_p = p.to_local() if isinstance(p, DTensor) else p
         move_indices_local = torch.rand(*local_x.shape, device=local_x.device) <= local_p
         
         move_indices = DTensor.from_local(
@@ -511,7 +583,14 @@ class Diffusion(torch.nn.Module):
     return edge
 
   def _sample_t(
-      self, batch_dims, device, sampling_eps_min, sampling_eps_max, block_size=None):
+      self, x0, device, sampling_eps_min, sampling_eps_max, block_size=None):
+    if isinstance(x0, DTensor):
+        local_batch_size = x0.to_local().shape[0]
+        batch_dims = list(x0.shape) 
+        batch_dims[0] = local_batch_size 
+    else:
+        batch_dims = x0.shape
+
     if block_size is None:
       block_size = self.block_size
     n = batch_dims[-1]
@@ -555,7 +634,7 @@ class Diffusion(torch.nn.Module):
 
   def _forward_pass_diffusion(self, x0, t=None, sampling_eps_min=None, sampling_eps_max=None):
     if t is None:
-      t = self._sample_t(x0.shape, x0.device, sampling_eps_min, sampling_eps_max)
+      t = self._sample_t(x0, x0.device, sampling_eps_min, sampling_eps_max)
 
     loss_scale, p = self.noise(t)
 
@@ -567,33 +646,6 @@ class Diffusion(torch.nn.Module):
       sigma, dsigma = self.noise.total_noise(t), self.noise.rate_noise(t)
       p = 1 - torch.exp(-sigma)
       loss_scale = - (dsigma / torch.expm1(sigma))
-
-    # --- sigma and p convert to DTensor ---
-    if isinstance(x0, DTensor):
-        local_x = x0.to_local()
-        local_sigma = sigma
-        # --- Convert 'sigma' ---
-        if sigma.shape[0] != local_x.shape[0]:
-            dp_rank = x0.device_mesh.get_local_rank(mesh_dim=0)
-            local_bs = local_x.shape[0]
-            start, end = dp_rank * local_bs, (dp_rank + 1) * local_bs
-            local_sigma = sigma[start:end]
-
-        local_sigma = local_sigma.to(x0.device_mesh.device_type)
-        
-        sigma = DTensor.from_local(
-            local_sigma, x0.device_mesh, [Shard(0), Replicate()]
-        )
-        # --- Convert 'p' ---
-        local_p = p
-        if p.shape[0] != local_x.shape[0]:
-            local_p = p[start:end]
-            
-        local_p = local_p.to(x0.device_mesh.device_type)
-        
-        p = DTensor.from_local(
-            local_p, x0.device_mesh, [Shard(0), Replicate()]
-        )
 
     xt = self.q_xt(x0, p, sampling_eps_min=sampling_eps_min, sampling_eps_max=sampling_eps_max)
     if sampling_eps_min is not None and sampling_eps_min > 0.5:
@@ -609,10 +661,15 @@ class Diffusion(torch.nn.Module):
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
-      return dsigma * self._score_entropy(model_output, sigma, xt, x0)
+      return dsigma * self._score_entropy(model_output_local, sigma, xt_local, x0_local)
+    
+    loss_local = _compute_local_loss_eager(model_output, x0, loss_scale)
 
-    log_p_theta = torch.gather(input=model_output, dim=-1, index=x0[:, :, None]).squeeze(-1)
-    loss = loss_scale * log_p_theta
+    if isinstance(x0, DTensor):
+        loss = ToDTensorBarrier.apply(loss_local, x0.device_mesh, x0.placements)
+    else:
+        loss = loss_local
+    
     return loss
 
   def compute_loss(self, x0, attention_mask, t=None, sampling_eps_min=None, sampling_eps_max=None):
