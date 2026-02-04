@@ -362,17 +362,19 @@ class Diffusion(torch.nn.Module):
     if block_size is None:
       block_size = self.block_size
     if isinstance(x, DTensor):
-        local_x = x.to_local()
-        local_p = p.to_local() if isinstance(p, DTensor) else p
-        move_indices_local = torch.rand(*local_x.shape, device=local_x.device) <= local_p
-        
-        move_indices = DTensor.from_local(
-            move_indices_local,
-            x.device_mesh,
-            x.placements
-        )
+      #print("q_xt received DTensor input")
+      local_x = x.to_local()
+      local_p = p.to_local() if isinstance(p, DTensor) else p
+      move_indices_local = torch.rand(*local_x.shape, device=local_x.device) <= local_p
+
+      move_indices = DTensor.from_local(
+          move_indices_local,
+          x.device_mesh,
+          x.placements
+      )
     else:
-        move_indices = torch.rand(*x.shape, device=x.device) <= p
+      #print("q_xt received regular Tensor input")
+      move_indices = torch.rand(*x.shape, device=x.device) <= p
 
     mask_val = self.mask_index
     if isinstance(mask_val, torch.Tensor):
@@ -657,6 +659,15 @@ class Diffusion(torch.nn.Module):
     if self.cross_attn:
       x_input = torch.cat((xt, x0), dim=-1)
 
+    #if isinstance(x0, DTensor):
+    #  print("Using x0 DTensor forward pass")
+    #
+    #if isinstance(xt, DTensor):
+    #  print("Using xt DTensor forward pass")
+    #
+    #if isinstance(x_input, DTensor):
+    #  print("Using x_input DTensor forward pass")
+    
     model_output = self.forward(x_input, sigma=sigma)
     utils.print_nans(model_output, 'model_output')
 

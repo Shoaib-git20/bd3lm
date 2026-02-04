@@ -18,6 +18,7 @@ from torch.distributed.fsdp import (
     BackwardPrefetch,
     ShardingStrategy,
     CPUOffload,
+    fully_shard,
 )
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
@@ -33,11 +34,17 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     SequenceParallel,
+    PrepareModuleInput,
 )
+
+from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+import torch._inductor
+from torch.distributed._tensor import DTensor, Replicate, Shard
+from torch.distributed.fsdp.wrap import wrap as fsdp_wrap
 
 import dataloader
 from diffusion_native import Diffusion
-from models.dit import DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer 
+from models.native_dit import DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer 
 import utils
 import metrics
 from dataclasses import dataclass
@@ -72,8 +79,23 @@ omegaconf.OmegaConf.register_new_resolver('div_up', lambda x, y: (x + y - 1) // 
 
 def get_optimizer_and_scheduler(model, config):
     """Create optimizer and learning rate scheduler."""
+    dtensor_params = []
+    local_params = []
+    
+    for p in model.parameters():
+        if p.requires_grad:
+            if isinstance(p, DTensor) or isinstance(p.data, DTensor):
+                dtensor_params.append(p)
+            else:
+                local_params.append(p)
+
+    param_groups = [
+        {'params': dtensor_params, 'name': 'dtensor_group'},
+        {'params': local_params, 'name': 'local_group'}
+    ]
+    
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=config.optim.lr,
         betas=(config.optim.beta1, config.optim.beta2),
         eps=config.optim.eps,
@@ -84,6 +106,40 @@ def get_optimizer_and_scheduler(model, config):
         config.lr_scheduler, optimizer=optimizer
     )
     return optimizer, scheduler
+
+def clip_grad_norm_hybrid(parameters, max_norm, norm_type=2.0):
+    """
+    Clips gradients for a model containing both DTensors (TP) and standard Tensors (Local).
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    
+    # Filter parameters that have gradients
+    params = [p for p in parameters if p.grad is not None]
+    
+    max_norm = float(max_norm)
+    norm_type = float(norm_type)
+    
+    total_norm = 0.0
+    
+    for p in params:
+        grad = p.grad.detach()
+        if isinstance(grad, DTensor):
+            param_norm = grad.norm(norm_type)
+            total_norm += param_norm.to_local().item() ** norm_type
+        else:
+            param_norm = grad.norm(norm_type)
+            total_norm += param_norm.item() ** norm_type
+            
+    total_norm = total_norm ** (1.0 / norm_type)
+    
+    clip_coef = max_norm / (total_norm + 1e-6)
+    
+    if clip_coef < 1:
+        for p in params:
+            p.grad.detach().mul_(clip_coef)
+            
+    return total_norm
 
 def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: bool = True) -> None:
   """Prints content of DictConfig using Rich library on the main process."""
@@ -105,146 +161,50 @@ def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: 
     with fsspec.open(f'{save_dir}/config_tree.txt', 'w') as fp:
       rich.print(tree, file=fp)
 
-def setup_distributed_model(model, config, local_rank):
-    """Sets up the model for distributed training with DDP or FSDP."""
-    
-    strategy_name = config.strategy.get('name', 'ddp') # Default to DDP
-    
-    if strategy_name == 'ddp':
-        model = model.to(local_rank)
-        return DDP(model, device_ids=[local_rank])
-    
-    elif strategy_name == 'fsdp':
-        # Configure mixed precision
-        mixed_precision_policy = None
-        if config.strategy.get('mixed_precision', 'fp32') == 'bf16':
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat16,
-            )
-        elif config.strategy.get('mixed_precision', 'fp32') == 'fp16':
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.float16,
-                reduce_dtype=torch.float16,
-                buffer_dtype=torch.float16,
-            )
 
-        # Define transformer wrapping policy
-        dit_auto_wrap_policy = functools.partial(
-           transformer_auto_wrap_policy,
-           transformer_layer_cls={
-               DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer
-           })
-
-        if config.strategy.sharding_strategy == 'FULL_SHARD':
-            sharding_strategy = ShardingStrategy.FULL_SHARD
-        elif config.strategy.sharding_strategy == 'SHARD_GRAD_OP':
-            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
-        elif config.strategy.sharding_strategy == 'HYBRID_SHARD':
-            sharding_strategy = ShardingStrategy.HYBRID_SHARD
+def debug_types(x, shift, scale, prefix="modulate_debug"):
+    def tinfo(t):
+        if isinstance(t, DTensor):
+            return f"DTensor shape={tuple(t.shape)} placements={getattr(t, 'placements', None)}"
+        elif isinstance(t, torch.Tensor):
+            return f"Tensor shape={tuple(t.shape)} dtype={t.dtype} device={t.device}"
         else:
-            raise ValueError(f"Unknown sharding strategy: {config.strategy.sharding_strategy}")
-        # Initialize FSDP wrapped model
-        model = FSDP(
-            model,
-            auto_wrap_policy=dit_auto_wrap_policy,
-            sharding_strategy=sharding_strategy,
-            mixed_precision=mixed_precision_policy,
-            device_id=torch.cuda.current_device(),
-            use_orig_params=True,
-        )
-        return model
-    elif strategy_name == 'tp':
-        # Initialize device mesh for tensor parallelism
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or 0))
-        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-        print(f"[rank {rank}/{world_size}] running on device {device}")
-        tp_size = 2
-        if world_size < tp_size or world_size % tp_size != 0:
-            pass
+            return f"Other type: {type(t)}"
+    print(f"[{prefix}] x: {tinfo(x)}")
+    print(f"[{prefix}] shift: {tinfo(shift)}")
+    print(f"[{prefix}] scale: {tinfo(scale)}")
 
-        model = model.to(device)
+def summarize_param_types(model):
+    dtensor_params = []
+    tensor_params = []
+    for name, p in model.named_parameters():
+        if isinstance(p, DTensor):
+            dtensor_params.append((name, getattr(p, "placements", None), tuple(p.shape)))
+        else:
+            tensor_params.append((name, p.shape))
+    if is_main_process():
+        print("DTensor params (sharded):")
+    for n, placements, shape in dtensor_params[:200]:
+        if is_main_process():
+            print(f"  {n} shape={shape} placements={placements}")
+    if is_main_process():
+        print(f"... total DTensor params: {len(dtensor_params)}")
+        print("Regular torch.Tensor params: (sample)")
+    for n, shape in tensor_params[:200]:
+        if is_main_process():
+            print(f"  {n} shape={shape}")
+    if is_main_process():
+        print(f"... total tensor params: {len(tensor_params)}")
+    return dtensor_params, tensor_params
 
-        mesh = init_device_mesh("cuda", (tp_size,))
-        print(f"[rank {rank}] DeviceMesh initialized with shape {(tp_size,)}")
-        # mesh_shape = (world_size,)
-        # device_ids = list(range(world_size))
-        # mesh = init_device_mesh(device_ids, mesh_shape)
-
-        # Define parallelization rules for layers
-        tp_layer_plan_patterns = {
-           "vocab_embed.embedding": "replicated",
-           "blocks.*.norm1": "sequence",
-           "blocks.*.norm2": "sequence",
-           "blocks.*.attn_qkv": "column",
-           "blocks.*.attn_out": "row",
-           "blocks.*.mlp.0": "column",
-           "blocks.*.mlp.2": "row",
-           "blocks.*.adaLN_modulation": "replicated",
-           "output_layer.norm_final": "sequence",
-           "output_layer.linear": "row",
-        }
-
-        def _pattern_to_regex(pattern: str):
-            # Escape dots and other chars, convert '*' to '.*'
-            # e.g. "blocks.*.attn_qkv" -> ^blocks\..*\.attn_qkv$
-            esc = re.escape(pattern)
-            regex = "^" + esc.replace(r"\*", ".*") + "$"
-            return re.compile(regex)
-
-        # Create list of compiled patterns
-        compiled_patterns = [(repl, _pattern_to_regex(pat)) for pat, repl in tp_layer_plan_patterns.items()]
-
-        def build_parallelize_plan(model):
-            """
-            Return dict mapping module FQN -> ParallelStyle() (ColwiseParallel/RowwiseParallel)
-            Only include modules that match patterns and have a parallel style (i.e., skip 'replicated').
-            """
-            plan = {}
-            for name, module in model.named_modules():
-                # try matching each pattern; the first matching pattern will apply
-                for pattern, cre in compiled_patterns:
-                    if cre.match(name):
-                        strategy = pattern # pattern variable contains e.g. "column", "row", "replicated"
-                        if pattern == "column":
-                            plan[name] = ColwiseParallel()
-                        elif pattern == "row":
-                            plan[name] = RowwiseParallel()
-                        elif pattern == "sequence":
-                            plan[name] = SequenceParallel()
-                        else:
-                            pass # 'replicated' or any None -> do not add to plan (default is replicated)
-                        break
-            return plan
-
-        # Build the plan using the actual model instance
-        # Note: ensure 'model' is defined above this snippet (your instantiated DIT model)
-        parallelize_plan = build_parallelize_plan(model)
-
-        # Debug print the plan (for rank 0)
-        if rank == 0:
-            print("Tensor Parallelize plan (FQN -> ParallelStyle):")
-            for k, v in parallelize_plan.items():
-                print(f"  {k} -> {v}")
-
-        # ---------- 5) Apply parallelize_module ----------
-        # This will transform parameters into DTensor and shard weights according to the plan.
-        # It must be called on all ranks.
-        # The src_data_rank argument defaults to 0 (rank that has the data if needed); we keep default here.
-        try:
-            parallelize_module(model, device_mesh=mesh, parallelize_plan=parallelize_plan)
-            print(f"[rank {rank}] parallelize_module done")
-        except Exception as e:
-            # If the API call fails (version mismatch), give a helpful message:
-            raise RuntimeError(
-                "parallelize_module failed. Make sure your PyTorch version supports torch.distributed.tensor.parallel "
-                "and DeviceMesh (PyTorch >= 2.3 / 2.4 recommended). Original error: " + str(e)
-            )
-    else:
-        raise ValueError(f"Unknown distributed strategy: {strategy_name}")
+def module_contains_dtensor(module) -> bool:
+    """
+    Returns True if *any* parameter inside `module` (recursively) is a DTensor.
+    """
+    for p in module.parameters(recurse=True):
+        if isinstance(p, DTensor):
+            return True
+    return False
 
 def _train(config, logger, tokenizer, device):
   """Main distributed training loop."""
@@ -252,25 +212,97 @@ def _train(config, logger, tokenizer, device):
   local_rank = int(os.environ["LOCAL_RANK"])
   
   if is_main_process():
-      logger.info(f'Starting {config.strategy.name} Training.')
+      logger.info(f'Starting {config.strategy.name} Training with world size {os.environ["WORLD_SIZE"]}.')
 
-  # --- Setup DDP DataLoaders ---
+  # --- Model ---
+  model = Diffusion(config, tokenizer)
   train_set, valid_set = dataloader.get_dataloaders(config, tokenizer)
 
-  train_sampler = DistributedSampler(train_set, shuffle=True)
-  valid_sampler = DistributedSampler(valid_set, shuffle=False)
+  dp_size = None
+  dp_rank = None
+  tp_mesh = None
+  dp_mesh = None
+  mesh_2d = None
+  device_type = torch.accelerator.current_accelerator().type
+  
+  if config.strategy.name == 'tp':
+    world_size = dist.get_world_size()
+    tp_size = 4
+    assert world_size % (tp_size) == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
+    dp_size = world_size // (tp_size)
+    model = model.to(device_type)
+    model, dp_mesh, tp_mesh, mesh_2d = apply_native_tp(model, config, tp_size, dp_size)
+    device_type = torch.accelerator.current_accelerator().type
+    if is_main_process():
+        print(f"[Debug][3D] Initializing 2D device mesh with shape ({dp_size}, {tp_size})")
+    
+    mesh_2d = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+
+    if is_main_process():
+        print(f"[Debug][3D] Device mesh initialized: {mesh_2d}")
+
+    tp_mesh = mesh_2d["tp"]
+    dp_mesh = mesh_2d["dp"]
+
+    tp_plan = {
+        "backbone.vocab_embed.embedding": RowwiseParallel(input_layouts=Replicate(),),
+
+        # "backbone.output_layer.norm_final": SequenceParallel(sequence_dim=1),
+
+        # "backbone.output_layer.linear": PrepareModuleInput(
+        #     input_layouts=Shard(1), 
+        #     desired_input_layouts=Replicate()
+        # ),
+        "backbone.output_layer.linear": ColwiseParallel(
+            output_layouts=Replicate()
+        ),
+    }
+
+    # --- Looping over DiT Blocks ---
+    n_blocks = len(model.backbone.blocks)
+    for i in range(n_blocks):
+        p = f"backbone.blocks.{i}"
+
+        tp_plan[f"{p}.atten.attn_qkv"] = ColwiseParallel(use_local_output=False)
+        tp_plan[f"{p}.atten.attn_out"] = RowwiseParallel()
+
+        tp_plan[f"{p}.mlp.w1"] = ColwiseParallel()
+
+        tp_plan[f"{p}.mlp.w2"] = RowwiseParallel()
+
+    parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
+    torch.cuda.synchronize()
+
+    #model = fully_shard(model, mesh=dp_mesh)
+    torch.cuda.synchronize()
+    dp_rank = dp_mesh.get_local_rank()
+    torch.manual_seed(dp_rank + 100)
+    summarize_param_types(model)
+
+    train_sampler = DistributedSampler(train_set, num_replicas=dp_size, rank=dp_rank, shuffle=True)
+    valid_sampler = DistributedSampler(valid_set, num_replicas=dp_size, rank=dp_rank, shuffle=False)
+  elif config.strategy.name == 'ddp':
+    model = DDP(model.to(local_rank), device_ids=[local_rank])
+    train_sampler = DistributedSampler(train_set, shuffle=True)
+    valid_sampler = DistributedSampler(valid_set, shuffle=False)
+  else:
+    raise ValueError(f"Unknown distributed strategy: {strategy_name}")
+
+  print(f"Model type after whole setup: {type(model)}")
+  # --- Setup DataLoaders ---
 
   train_loader = torch.utils.data.DataLoader(
     train_set,
     batch_size=config.loader.batch_size,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
-    shuffle=not config.data.streaming and train_sampler is None,
+    #shuffle=not config.data.streaming and train_sampler is None,
+    shuffle=False,
     sampler=train_sampler,
     persistent_workers=True)
   
   train_loader.tokenizer = tokenizer
-  print("Train loader created and train tokenizer set is ready")
+  logger.info("Train loader created and train tokenizer set is ready")
 
   valid_loader = torch.utils.data.DataLoader(
     valid_set,
@@ -280,14 +312,10 @@ def _train(config, logger, tokenizer, device):
     shuffle=False,
     sampler=valid_sampler,
     generator=None)
-  # Will be used in generative perplexity calculation
   valid_loader.tokenizer = tokenizer
-  print("Valid loader created and valid tokenizer set is ready")
+  logger.info("Valid loader created and valid tokenizer set is ready")
 
-  # --- Model, Optimizer, Scheduler ---
-  model = Diffusion(config, tokenizer)
-  
-  setup_distributed_model(model, config, local_rank)
+  # --- Optimizer, Scheduler ---
 
   optimizer, scheduler = get_optimizer_and_scheduler(model, config)
 
@@ -322,9 +350,10 @@ def _train(config, logger, tokenizer, device):
   # --- Training Loop ---
   max_steps = config.trainer.max_steps
   training_complete = False
-  if config.strategy.name == 'fsdp':
-      model.sampling_eps_min = torch.tensor(config.training.sampling_eps_min)
-      model.sampling_eps_max = torch.tensor(config.training.sampling_eps_max)
+
+  if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
+    model.sampling_eps_min = torch.tensor(config.training.sampling_eps_min)
+    model.sampling_eps_max = torch.tensor(config.training.sampling_eps_max)
 
   for epoch in range(start_epoch, 1000): # Loop for a large number of epochs
     train_sampler.set_epoch(epoch)
@@ -337,12 +366,11 @@ def _train(config, logger, tokenizer, device):
             training_complete = True
             break
             
-        input_ids = batch['input_ids'].to(local_rank)
-        attention_mask = batch['attention_mask'].to(local_rank)
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        if config.strategy.name in ('fsdp', 'tp', '3d'):
-            loss_obj = model.compute_loss(input_ids, attention_mask)
+        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
             if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
               sampling_eps_min = model.sampling_eps_min.item()
               sampling_eps_max = model.sampling_eps_max.item()
@@ -357,12 +385,9 @@ def _train(config, logger, tokenizer, device):
               loss = - output.gather(-1, output_tokens[:, :, None])[:, :, 0]
             else:
               loss = model._forward_pass_diffusion(
-                input_tokens,
-                sampling_eps_min=sampling_eps_min,
-                sampling_eps_max=sampling_eps_max)
-
+                        input_tokens, sampling_eps_min=sampling_eps_min, sampling_eps_max=sampling_eps_max)
             if model.ignore_bos and not model.training:
-              attention_mask[:, 0] = 0
+                attention_mask[:, 0] = 0
 
             nlls = (loss * attention_mask)
             token_nll = nlls.sum() / attention_mask.sum()
@@ -373,11 +398,21 @@ def _train(config, logger, tokenizer, device):
         loss = loss_obj.loss
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if config.strategy.name == '3d':
+            local_grads = [p.grad for p in model.parameters()
+               if p.grad is not None and not isinstance(p.grad, DTensor)]
+
+            for g in local_grads:
+                dist.all_reduce(g, op=dist.ReduceOp.AVG)
+
+        clip_grad_norm_hybrid(model.parameters(), 1.0)
+
         optimizer.step()
+
         scheduler.step()
 
-        if config.strategy.name in ('fsdp', 'tp', '3d'):
+        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
             if model.ema:
                 model.ema.update(model.parameters())
         else:
@@ -437,7 +472,7 @@ def _train(config, logger, tokenizer, device):
 def main(config):
   """Main entry point for DDP training."""
   # DDP is assumed to be used if this script is run
-  use_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+  use_ddp = int(os.environ.get("WORLD_SIZE", 1)) >= 1
   if use_ddp:
       setup_ddp()
   
@@ -456,7 +491,7 @@ def main(config):
     _train(config, logger, tokenizer, device)
   else:
       if is_main_process():
-          logger.warning("sample_eval and ppl_eval modes are not configured for DDP. Please run them on a single GPU using main_native.py.")
+          logger.warning("sample_eval and ppl_eval modes are not configured yet")
 
   if use_ddp:
       cleanup_ddp()

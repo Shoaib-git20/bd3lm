@@ -44,7 +44,7 @@ from torch.distributed.fsdp.wrap import wrap as fsdp_wrap
 
 import dataloader
 from diffusion_native import Diffusion
-from models.dit import DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer 
+from models.native_dit import DDiTBlock, DDiTBlockCausal, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer 
 import utils
 import metrics
 from dataclasses import dataclass
@@ -79,8 +79,23 @@ omegaconf.OmegaConf.register_new_resolver('div_up', lambda x, y: (x + y - 1) // 
 
 def get_optimizer_and_scheduler(model, config):
     """Create optimizer and learning rate scheduler."""
+    dtensor_params = []
+    local_params = []
+    
+    for p in model.parameters():
+        if p.requires_grad:
+            if isinstance(p, DTensor) or isinstance(p.data, DTensor):
+                dtensor_params.append(p)
+            else:
+                local_params.append(p)
+
+    param_groups = [
+        {'params': dtensor_params, 'name': 'dtensor_group'},
+        {'params': local_params, 'name': 'local_group'}
+    ]
+    
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=config.optim.lr,
         betas=(config.optim.beta1, config.optim.beta2),
         eps=config.optim.eps,
@@ -91,6 +106,40 @@ def get_optimizer_and_scheduler(model, config):
         config.lr_scheduler, optimizer=optimizer
     )
     return optimizer, scheduler
+
+def clip_grad_norm_hybrid(parameters, max_norm, norm_type=2.0):
+    """
+    Clips gradients for a model containing both DTensors (TP) and standard Tensors (Local).
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    
+    # Filter parameters that have gradients
+    params = [p for p in parameters if p.grad is not None]
+    
+    max_norm = float(max_norm)
+    norm_type = float(norm_type)
+    
+    total_norm = 0.0
+    
+    for p in params:
+        grad = p.grad.detach()
+        if isinstance(grad, DTensor):
+            param_norm = grad.norm(norm_type)
+            total_norm += param_norm.to_local().item() ** norm_type
+        else:
+            param_norm = grad.norm(norm_type)
+            total_norm += param_norm.item() ** norm_type
+            
+    total_norm = total_norm ** (1.0 / norm_type)
+    
+    clip_coef = max_norm / (total_norm + 1e-6)
+    
+    if clip_coef < 1:
+        for p in params:
+            p.grad.detach().mul_(clip_coef)
+            
+    return total_norm
 
 def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: bool = True) -> None:
   """Prints content of DictConfig using Rich library on the main process."""
@@ -157,135 +206,7 @@ def module_contains_dtensor(module) -> bool:
             return True
     return False
 
-def fsdp_wrap_safe(root_model, fsdp_class=FSDP, fsdp_kwargs=None, max_depth=None):
-    """
-    Wraps submodules of `root_model` with FSDP safely:
-    - If a submodule contains ANY DTensor params, it is NOT wrapped.
-    - Instead, we recurse into its children and try to wrap safe grandchildren.
-    - If a submodule contains NO DTensor params (i.e., fully local Tensor params),
-      it is wrapped as a unit with FSDP.
-
-    Parameters:
-      - root_model: top-level model to process (modify in-place)
-      - fsdp_class: FSDP class to use (default torch.distributed.fsdp.FullyShardedDataParallel)
-      - fsdp_kwargs: kwargs forwarded to FSDP(...) when wrapping
-      - max_depth: optional int limiting recursion depth (None => unlimited)
-
-    Returns:
-      - root_model (modified)
-    """
-    if fsdp_kwargs is None:
-        fsdp_kwargs = {}
-
-    def _rec_wrap(module, prefix="", depth=0):
-        # stop recursion if depth limit reached
-        if (max_depth is not None) and (depth > max_depth):
-            return module
-
-        # If module contains ANY DTensor parameters, do NOT wrap it.
-        # Instead, attempt to wrap its children individually.
-        if module_contains_dtensor(module):
-            # recurse into children
-            for child_name, child in list(module.named_children()):
-                full_name = f"{prefix}.{child_name}" if prefix else child_name
-                # process child and replace if changed
-                wrapped_child = _rec_wrap(child, prefix=full_name, depth=depth+1)
-                if wrapped_child is not child:
-                    setattr(module, child_name, wrapped_child)
-            return module
-        else:
-            # no DTensor inside this module -> safe to wrap
-            try:
-                wrapped = fsdp_class(module, **fsdp_kwargs)
-                print(f"[fsdp_wrap_safe] Wrapped '{prefix or module.__class__.__name__}' with FSDP")
-                return wrapped
-            except Exception as e:
-                # fallback: log and leave module unwrapped
-                print(f"[fsdp_wrap_safe][WARN] Failed to wrap '{prefix}': {e}")
-                return module
-
-    # Start recursion at immediate named children of root_model:
-    for name, child in list(root_model.named_children()):
-        wrapped = _rec_wrap(child, prefix=name, depth=0)
-        if wrapped is not child:
-            setattr(root_model, name, wrapped)
-
-    return root_model
-
-# corrected snippet (only the tp_plan part and parallelize call shown)
-
-def apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
-
-    device_type = torch.accelerator.current_accelerator().type
-    if is_main_process():
-        print(f"[Debug][3D] Initializing 2D device mesh with shape ({dp_size}, {tp_size})")
-    
-    mesh_2d = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-
-    if is_main_process():
-        print(f"[Debug][3D] Device mesh initialized: {mesh_2d}")
-
-    tp_mesh = mesh_2d["tp"]  # a submesh that connects intra-host devices
-    dp_mesh = mesh_2d["dp"]  # a submesh that connects inter-host devices
-
-    tp_plan = {
-
-        # --- EMBEDDING ---
-        # Embedding weights are typically row-sharded on vocab dimension
-        # Output should be sequence-sharded to align with SP pipeline
-        "backbone.vocab_embed.embedding": RowwiseParallel(
-            input_layouts=Replicate(),   # input token IDs are replicated across TP ranks
-            output_layouts=Shard(dim=1), # outputs sharded along sequence dim for SP
-            use_local_output=False,
-        ),
-        "backbone.output_layer.linear": ColwiseParallel(
-            input_layouts=Replicate(),
-            output_layouts=Replicate(),
-            use_local_output=True,   # ensure local tensor for loss / FSDP consumption
-        ),
-
-        # final norm: run on sequence-sharded slices and return local output
-        "backbone.output_layer.norm_final": SequenceParallel(sequence_dim=1, use_local_output=True),
-
-        "backbone.sigma_map.mlp.0": SequenceParallel(sequence_dim=1, use_local_output=False),
-        # The output (t_cond) must be replicated for AdaLN, so use RowwiseParallel last
-        "backbone.sigma_map.mlp.2": SequenceParallel(sequence_dim=1, use_local_output=False),
-    }
-
-    n_blocks = len(model.backbone.blocks)
-    for i in range(n_blocks):
-        p = f"backbone.blocks.{i}"
-
-        tp_plan[f"{p}.norm1"] = SequenceParallel(sequence_dim=1, use_local_output=False)
-        tp_plan[f"{p}.norm2"] = SequenceParallel(sequence_dim=1, use_local_output=False)
-        
-        # AdaLN modulation: sequence_dim=1
-        tp_plan[f"{p}.adaLN_modulation"] = SequenceParallel(sequence_dim=1, use_local_output=False)
-
-        # attention qkv: assume sequence is sharded, project features (colwise on feature dim)
-        tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=Replicate(),output_layouts=Shard(-1),use_local_output=False)
-
-        #tp_plan[f"{p}.attn_qkv"] = ColwiseParallel(input_layouts=(Shard(1),Replicate()),use_local_output=False)
-        tp_plan[f"{p}.attn_out"] = RowwiseParallel(input_layouts=Shard(-1), output_layouts=Shard(1), use_local_output=False)
-
-        # MLP: use dot notation mlp.0 and mlp.2 (not mlp[0])
-        tp_plan[f"{p}.mlp.0"] = ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1), use_local_output=False)
-        tp_plan[f"{p}.mlp.2"] = RowwiseParallel(input_layouts=Shard(-1), output_layouts=Shard(1) , use_local_output=False)
-
-    if is_main_process():
-        print("Tensor Parallelize plan (FQN -> ParallelStyle):")
-        for k, v in tp_plan.items():
-            print(f"  {k} -> {v}")
-
-    # call parallelize_module with explicit kwargs (safer)
-    parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
-    torch.cuda.synchronize()
-
-    model = fully_shard(model, mesh=dp_mesh)
-
-    return model, dp_mesh, tp_mesh, mesh_2d
-
-def native_apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
+def apply_native_tp(model, config, tp_size, dp_size):
 
     device_type = torch.accelerator.current_accelerator().type
     if is_main_process():
@@ -300,87 +221,41 @@ def native_apply_tp_fsdp_with_sp(model, config, tp_size, dp_size):
     dp_mesh = mesh_2d["dp"]
 
     tp_plan = {
-        # --- Global Inputs ---
-        # 1. Vocab Embed: Output is Sequence Sharded (Memory Efficient)
-        "backbone.vocab_embed.embedding": RowwiseParallel(),
+        "backbone.vocab_embed.embedding": RowwiseParallel(
+            input_layouts=Replicate(),
+        ),
 
-        # --- The Output Block ---
-        # Final Norm runs on the local sequence shard
         # "backbone.output_layer.norm_final": SequenceParallel(sequence_dim=1),
 
-        # Gather before final Linear projection
         # "backbone.output_layer.linear": PrepareModuleInput(
         #     input_layouts=Shard(1), 
         #     desired_input_layouts=Replicate()
         # ),
-        #"backbone.output_layer.linear": ColwiseParallel(
-        #    input_layouts=Replicate(),
-        #    output_layouts=Replicate()
-        #),
+        "backbone.output_layer.linear": ColwiseParallel(
+            output_layouts=Replicate()
+        ),
     }
 
-    # --- Loop over DiT Blocks ---
+    # --- Looping over DiT Blocks ---
     n_blocks = len(model.backbone.blocks)
     for i in range(n_blocks):
         p = f"backbone.blocks.{i}"
+#
+        tp_plan[f"{p}.atten.attn_qkv"] = ColwiseParallel(use_local_output=False)
+        tp_plan[f"{p}.atten.attn_out"] = RowwiseParallel()
 
-        # 1. Norms: Run locally on the sequence shard
-        # tp_plan[f"{p}.norm1"] = SequenceParallel(sequence_dim=1)
-        # tp_plan[f"{p}.norm2"] = SequenceParallel(sequence_dim=1)
+        tp_plan[f"{p}.mlp.w1"] = ColwiseParallel()
 
-        # 3. Attention Block (Sandwich)
-        # tp_plan[f"{p}.atten"] = PrepareModuleInput(
-        #     input_layouts=(Shard(1),), 
-        #     desired_input_layouts=(Replicate(),), 
-        # )
+        tp_plan[f"{p}.mlp.w2"] = RowwiseParallel()
 
-        #tp_plan[f"{p}.atten.attn_qkv"] = ColwiseParallel(
-        #    input_layouts=(Shard(0), Replicate()), 
-        #    output_layouts=(Shard(0), Shard(-1)), 
-        #    use_local_output=False
-        #)
-        #tp_plan[f"{p}.atten.attn_out"] = RowwiseParallel(
-        #    input_layouts=(Shard(0), Shard(-1)),
-        #    output_layouts=(Shard(0), Replicate()), 
-        #    use_local_output=False
-        #)
-
-        tp_plan[f"{p}.mlp.w1"] = ColwiseParallel(
-                input_layouts=(Shard(0), Replicate()),
-                output_layouts=(Shard(0), Shard(-1)),
-                use_local_output=False
-        )
-
-        tp_plan[f"{p}.mlp.w2"] = RowwiseParallel(
-            input_layouts=(Shard(0), Shard(-1)),
-            output_layouts=(Shard(0), Replicate()),
-            use_local_output=False
-        )
-
-    if is_main_process():
-        print("Tensor Parallelize plan (FQN -> ParallelStyle):")
-        for k, v in tp_plan.items():
-            print(f"  {k} -> {v}")
-
-    # call parallelize_module with explicit kwargs (safer)
     parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
     torch.cuda.synchronize()
 
-    model = fully_shard(model, mesh=dp_mesh)
+    #model = fully_shard(model, mesh=dp_mesh)
 
     return model, dp_mesh, tp_mesh, mesh_2d
 
 def setup_fsdp_model(model, config, local_rank, mesh=None):
-   # Debug: surface fsdp setup inputs
-    #try:
-    #    _ws = dist.get_world_size()
-    #    _rk = dist.get_rank()
-    #except Exception:
-    #    _ws = None
-    #    _rk = None
-    #print(f"[Debug][FSDP setup] local_rank={local_rank} rank={_rk} world_size={_ws} mesh_provided={'yes' if mesh is not None else 'no'}")
-    #print(f"[Debug][FSDP setup] requested sharding_strategy={getattr(config.strategy, 'sharding_strategy', None)} mixed_precision={config.strategy.get('mixed_precision', 'fp32')}")
-   # Configure mixed precision
     mixed_precision_policy = None
     if config.strategy.get('mixed_precision', 'fp32') == 'bf16':
         mixed_precision_policy = MixedPrecision(
@@ -396,7 +271,7 @@ def setup_fsdp_model(model, config, local_rank, mesh=None):
         )
     elif config.strategy.get('name', 'ddp') == '3d':
         mixed_precision_policy = None
-    # Define transformer wrapping policy
+
     dit_auto_wrap_policy = functools.partial(
        transformer_auto_wrap_policy,
        transformer_layer_cls={
@@ -412,20 +287,18 @@ def setup_fsdp_model(model, config, local_rank, mesh=None):
         sharding_strategy = None
     else:
         raise ValueError(f"Unknown sharding strategy: {config.strategy.sharding_strategy}")
-    # Initialize FSDP wrapped model
+
     if config.strategy.get('name') == '3d':
         fsdp_kwargs = dict(auto_wrap_policy=dit_auto_wrap_policy, 
                             device_id=torch.cuda.current_device(), 
                             sharding_strategy=sharding_strategy, mixed_precision=mixed_precision_policy,
                             use_orig_params=True, device_mesh=mesh,)
-        #model = fsdp_wrap_safe(model, FSDP, fsdp_kwargs)
 
         for block in model.backbone.blocks:
             fully_shard(block, mesh=mesh,mp_policy=mixed_precision_policy)
 
         fully_shard(model, mesh=mesh,mp_policy=mixed_precision_policy)
         return model
-
     else :
         model = FSDP(
             model,
@@ -437,178 +310,12 @@ def setup_fsdp_model(model, config, local_rank, mesh=None):
         )
     return model
 
-def setup_tp_model(model, config, local_rank, tp_size, rank, world_size, tp_mesh=None):
-    # Debug: entering TP model setup
-    #print(f"[Debug][TP setup] entering setup_tp_model: rank={rank} world_size={world_size} local_rank={local_rank} tp_size={tp_size}")
-    if tp_mesh is None:
-        tp_mesh = init_device_mesh("cuda", (tp_size,))
-
-    tp_layer_plan_patterns = {
-        "backbone.vocab_embed.embedding": "replicated",
-        "backbone.blocks.*.norm1": "sequence",
-        "backbone.blocks.*.norm2": "sequence",
-        "backbone.blocks.*.attn_qkv": "column",
-        "backbone.blocks.*.attn_out": "row",
-        #"backbone.blocks.*.mlp.*0": "column",
-        #"backbone.blocks.*.mlp.*2": "row",
-        "backbone.blocks.*.adaLN_modulation": "replicated",
-        "backbone.output_layer.norm_final": "sequence",
-        "backbone.output_layer.linear": "row",
-        #"backbone.blocks.*": "replicated",
-    }
-
-    # Build the plan using the actual model instance
-    # Note: ensure 'model' is defined above this snippet (your instantiated DIT model)
-
-    # precompile regexes safely (escape dots, convert '*' -> '.*')
-    compiled_patterns = []
-    for pat, style in tp_layer_plan_patterns.items():
-        esc = re.escape(pat)
-        regex = "^" + esc.replace(r"\*", ".*") + "$"
-        compiled_patterns.append((re.compile(regex), style, pat))
-
-    parallelize_plan = {}
-    skipped = []
-
-    for name, module in model.named_modules():
-        #if is_main_process():
-        #    print(f"[Debug][TP setup] Examining module: {name} ({type(module)})")
-        matched_any = False
-        for cre, style, pat in compiled_patterns:
-            if cre.match(name):
-                matched_any = True
-                # column/row require Linear or Embedding
-                if style in ("column", "row"):
-                    if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-                        parallelize_plan[name] = ColwiseParallel() if style == "column" else RowwiseParallel()
-                    elif isinstance(module, torch.nn.Sequential):
-                        for child_name, child in module.named_children():
-                            full_name = f"{name}.{child_name}"
-                            if isinstance(child, torch.nn.Linear):
-                                if "mlp.0" in full_name:
-                                    parallelize_plan[full_name] = ColwiseParallel()
-                                elif "mlp.2" in full_name:
-                                    parallelize_plan[full_name] = RowwiseParallel()
-                    else:
-                        skipped.append((name, style, type(module).__name__, pat))
-                        #if is_main_process():
-                        #    print(f"[TP planner] Skipping {name}: requested '{style}' but module is {type(module).__name__} (pattern={pat})")
-                elif style == "sequence":
-                    # accept if name includes 'norm' or module looks like LayerNorm (or custom norm)
-                    if "norm" in name.lower() or "norm" in module.__class__.__name__.lower() or isinstance(module, torch.nn.LayerNorm):
-                        parallelize_plan[name] = SequenceParallel()
-                    else:
-                        skipped.append((name, style, type(module).__name__, pat))
-                        #if is_main_process():
-                        #    print(f"[TP planner] Skipping {name}: requested 'sequence' but module is {type(module).__name__} (pattern={pat})")
-                #else:
-                    # 'replicated' -> intentionally no entry (kept replicated)
-                    #if is_main_process():
-                    #    print(f"[TP planner] {name} set to 'replicated' by pattern {pat}")
-                #break  # stop checking other patterns after first match
-        # optional: track names that matched no pattern
-        #if not matched_any:
-        #    if is_main_process():
-        #        print(f"[TP planner] No pattern matched for {name}")
-    # summary
-    # TEMP DEBUG: check Colwise/Rowwise targets before calling parallelize_module
-    #if is_main_process():
-    #    module_map = dict(model.named_modules())  # compute once
-    #    colrow_warnings = []  # (name, expected_style, actual_type)
-    #    colrow_valid = []     # (name, style, actual_type)
-#
-    #    for name, style in parallelize_plan.items():
-    #        # style is an instance of ParallelStyle (ColwiseParallel, RowwiseParallel, SequenceParallel, ...)
-    #        if isinstance(style, (ColwiseParallel, RowwiseParallel)):
-    #            module = module_map.get(name)
-    #            if module is None:
-    #                colrow_warnings.append((name, style.__class__.__name__, "NOT FOUND"))
-    #            else:
-    #                # strict check first
-    #                if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-    #                    colrow_valid.append((name, style.__class__.__name__, module.__class__.__name__))
-    #                else:
-    #                    # broadened "linear-like" heuristic: subclass or custom wrapper
-    #                    cls_name = module.__class__.__name__.lower()
-    #                    if "linear" in cls_name or "embedding" in cls_name:
-    #                        colrow_valid.append((name, style.__class__.__name__, module.__class__.__name__ + " (linear-like)"))
-    #                    else:
-    #                        colrow_warnings.append((name, style.__class__.__name__, module.__class__.__name__))
-#
-    #    # Print results
-    #    if colrow_valid:
-    #        print("[TP check] Colwise/Rowwise valid targets:")
-    #        for n, s, t in colrow_valid:
-    #            print(f"  {n} -> {s} (module type: {t})")
-    #    else:
-    #        print("[TP check] No Colwise/Rowwise valid targets found.")
-#
-    #    if colrow_warnings:
-    #        print("[TP check][WARN] Colwise/Rowwise targets with issues:")
-    #        for n, s, t in colrow_warnings:
-    #            print(f"  {n} -> {s} (module type: {t})")
-    #    else:
-    #        print("[TP check] No warnings for Colwise/Rowwise targets.")
-
-
-    # ---------- 5) Apply parallelize_module ----------
-    # This will transform parameters into DTensor and shard weights according to the plan.
-    # It must be called on all ranks.
-    # The src_data_rank argument defaults to 0 (rank that has the data if needed); we keep default here.
-    # run this BEFORE calling parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=parallelize_plan)
-    if is_main_process():
-        print("Tensor Parallelize plan (FQN -> ParallelStyle):")
-        for k, v in parallelize_plan.items():
-            print(f"  {k} -> {v}")
-
-    #from torch.distributed.tensor.parallel.api import parallelize_module as _parallelize_module
-    #import traceback
-#
-    #if is_main_process():
-    #    print("[TP debug] Starting per-mapping check...")
-#
-    #bad = []
-    #for fname, style in list(parallelize_plan.items()):
-    #    small_plan = {fname: style}
-    #    try:
-    #        # Apply only this single mapping to a fresh copy of the model structure.
-    #        # IMPORTANT: we apply in-place to the real model but with a single-plan so we can localize failures.
-    #        if is_main_process():    
-    #            print(f"[TP debug] Testing mapping {fname} -> {style.__class__.__name__}")
-    #        _parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=small_plan)
-    #        if is_main_process():
-    #            print(f"[TP debug] OK: {fname}")
-    #    except NotImplementedError as e:
-    #        if is_main_process():
-    #            print(f"[TP debug][ERROR] Mapping failed for {fname}: {e}")
-    #        bad.append(fname)
-    #    except Exception as e:
-    #        if is_main_process():
-    #            print(f"[TP debug][ERROR] Unexpected error for {fname}: {type(e).__name__}: {e}")
-    #            traceback.print_exc()
-    #if is_main_process():
-    #    print(f"[TP debug] Per-mapping check complete. {len(bad)} failing mappings: {bad}")
-    model = parallelize_module(model, device_mesh=tp_mesh, parallelize_plan=parallelize_plan)
-        #print(f"[rank {rank}] parallelize_module done")
-    return model
-   
-
 def setup_distributed_model(model, logger, config, local_rank):
     """Sets up the model for distributed training with DDP or FSDP."""
     
     strategy_name = config.strategy.get('name', 'ddp') # Default to DDP
-    # Debug: surface selection info
-    #try:
-    #    _world_size = dist.get_world_size()
-    #    _rank = dist.get_rank()
-    #except Exception:
-    #    _world_size = None
-    #    _rank = None
-    #print(f"[Debug][setup_distributed_model] strategy={strategy_name} local_rank={local_rank} rank={_rank} world_size={_world_size}")
-    
+      
     if strategy_name == 'ddp':
-        # DDP: move model to the local CUDA device and wrap with DistributedDataParallel
-        #print(f"[Debug][DDP] rank={_rank} local_rank={local_rank} wrapping model with DDP on cuda:{local_rank}")
         model = model.to(local_rank)
         return DDP(model, device_ids=[local_rank])
 
@@ -622,122 +329,6 @@ def setup_distributed_model(model, logger, config, local_rank):
         model = setup_fsdp_model(model, config, local_rank)
         logger.info(f"FSDP model setup complete on world_size={world_size} rank={rank}")
         return model
-        
-    elif strategy_name == 'tp':
-        # Initialize device mesh for tensor parallelism
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        #local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or 0))
-        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-        tp_size = 2
-        #print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
-        #print(f"[Debug][TP] preparing tensor-parallel setup: tp_size={tp_size} local_rank={local_rank} rank={rank} world_size={world_size}")
-        if world_size < tp_size or world_size % tp_size != 0:
-            pass
-
-        model = model.to(device)
-
-        model = setup_tp_model(model, config, local_rank, tp_size, rank, world_size)
-        logger.info(f"TP model setup complete with tp_size={tp_size} on world_size={world_size} rank={rank}")
-
-        return model
-    elif strategy_name == '3d':
-        tp_size = 4
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        logger.info(f"[Debug][3D] Initializing 3D parallel strategy with tp_size={tp_size} on world_size={world_size}...")
-        #print(f"[Debug][3D] local_rank={local_rank} rank={rank} World size: {world_size}, TP size: {tp_size}")
-
-        assert world_size % (tp_size) == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
-        dp_size = world_size // (tp_size)
-
-        #logger.info(f"[Debug][3D] Initializing 2D device mesh with shape ({dp_size}, {tp_size})")
-        #mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-        #logger.info(f"[Debug][3D] Device mesh initialized: {mesh_2d}")
-#
-        #tp_mesh = mesh_2d["tp"]  # a submesh that connects intra-host devices
-        #dp_mesh = mesh_2d["dp"]  # a submesh that connects inter-host devices
-      #  tp_group = tp_mesh.get_group()
-
-        #logger.info(f"[Debug][3D] TP mesh: {tp_mesh}, group size={tp_size}")
-        #logger.info(f"[Debug][3D] Created DP mesh: {dp_mesh}")
-
-        # --- Enable symmetric memory for this TP group ---
-
-        #logger.info(f"[Debug][3D] Enabling symmetric memory for TP group...")
-      #  try:
-      #      # If user code already provided a name string
-      #      if isinstance(tp_group, str):
-      #          group_name = tp_group
-      #      else:
-      #          # Common attribute added by DeviceMesh.get_group() in many PyTorch builds
-      #          group_name = getattr(tp_group, "group_name", None)
-#
-      #          # alternate attribute names some builds expose
-      #          if group_name is None:
-      #              group_name = getattr(tp_group, "name", None)
-      #          if group_name is None and hasattr(tp_group, "get_group_name"):
-      #              try:
-      #                  group_name = tp_group.get_group_name()
-      #              except Exception:
-      #                  group_name = None
-#
-      #      if not group_name:
-      #          raise RuntimeError(
-      #              "Could not determine the process-group name for tp_group. "
-      #              "enable_symm_mem_for_group requires a string group name (e.g. tp_group.group_name). "
-      #              "If your ProcessGroup object has no name, create or obtain a named ProcessGroup "
-      #              "from DeviceMesh.get_group() or upgrade PyTorch so DeviceMesh exposes group_name."
-      #          )
-#
-      #      # Now call the symmetric memory helper with the string name:
-      #      enable_symm_mem_for_group(group_name)
-      #      #logger.info(f"[Debug][3D] Symmetric memory enabled for group '{group_name}'")
-#
-      #  except Exception as e:
-      #      # bubble up a clearer error showing what we received
-      #      raise RuntimeError(
-      #          f"Failed to enable symmetric memory for TP group. tp_group type={type(tp_group)}, "
-      #          f"attrs={[a for a in dir(tp_group) if not a.startswith('__')] if not isinstance(tp_group, str) else 'string'}; "
-      #          f"error={e}"
-      #      ) from e
-#
-      #  # --- Configure torch.compile for async TP ---
-      #  torch._inductor.config._micro_pipeline_tp = True
-      #  #logger.info(f"[Debug][3D] torch.compile micro-pipeline async-TP mode enabled.")
-
-        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-        #print(f"[rank {rank}/{world_size}] running on device {device} (cuda:local-rank)")
-        #logger.info(f"[Debug][3D] Process rank {rank} moved model to device {device}")
-
-        model = model.to(device)
-        #logger.info(f"[Debug][3D] Setting up Tensor Parallel model...")
-        model = apply_tp_fsdp_with_sp(model, config, tp_size, dp_size)
-        torch.cuda.synchronize()
-
-        # apply FSDP inter-host on dp_mesh
-        #logger.info(f"[Debug][3D] Setting up FSDP with DP mesh = {dp_mesh}...")
-        #model = setup_fsdp_model(model, config, local_rank, mesh=dp_mesh)
-        summarize_param_types(model)
-        # and list which top-level modules were wrapped:
-        #if is_main_process():
-        #    print("Going into FSDP-wrapped model, listing top-level children:")
-        #    for name, child in model.named_children():
-        #        print(name, type(child))
-        #    print("FSDP naming complete.")
-#
-        #print(f"Model type after fsdp setup: {type(model)}")
-        logger.info(f"[Debug][3D] FSDP setup complete")
-
-        #try:
-        #    model = torch.compile(model)
-        #    #logger.info(f"[Debug][3D] Model compiled with torch.compile for async TP.")
-        #except Exception as e:
-        #    logger.warning(f"[Warning] torch.compile(model) failed: {e}")
-        logger.info(f"[Debug][3D] Model is now wrapped with 3D parallelism (TP + FSDP).")
-
-        return model
-
     elif strategy_name == "async_tp":
         # async tensor-parallel only (1 node, 2 GPUs per node)
         print("[Debug] Initializing official async-TP strategy (1 node, 2 GPUs)...")
@@ -750,7 +341,6 @@ def setup_distributed_model(model, logger, config, local_rank):
             f"async_tp expects single node with {tp_size} GPUs, got world_size={world_size}"
         )
 
-        # --- Build the TP mesh ---
         mesh_1d = init_device_mesh("cuda", (tp_size,), mesh_dim_names=("tp",))
         tp_mesh = mesh_1d["tp"]
         tp_group = tp_mesh.get_group()
@@ -760,14 +350,11 @@ def setup_distributed_model(model, logger, config, local_rank):
 
         print("[Debug] Enabling symmetric memory for TP group...")
         try:
-            # If user code already provided a name string
             if isinstance(tp_group, str):
                 group_name = tp_group
             else:
-                # Common attribute added by DeviceMesh.get_group() in many PyTorch builds
                 group_name = getattr(tp_group, "group_name", None)
 
-                # alternate attribute names some builds expose
                 if group_name is None:
                     group_name = getattr(tp_group, "name", None)
                 if group_name is None and hasattr(tp_group, "get_group_name"):
@@ -784,12 +371,10 @@ def setup_distributed_model(model, logger, config, local_rank):
                     "from DeviceMesh.get_group() or upgrade PyTorch so DeviceMesh exposes group_name."
                 )
 
-            # Now call the symmetric memory helper with the string name:
             enable_symm_mem_for_group(group_name)
             print(f"[Debug] Symmetric memory enabled for group '{group_name}'")
 
         except Exception as e:
-            # bubble up a clearer error showing what we received
             raise RuntimeError(
                 f"Failed to enable symmetric memory for TP group. tp_group type={type(tp_group)}, "
                 f"attrs={[a for a in dir(tp_group) if not a.startswith('__')] if not isinstance(tp_group, str) else 'string'}; "
@@ -798,17 +383,14 @@ def setup_distributed_model(model, logger, config, local_rank):
     
         print("[Debug] Symmetric memory enabled.")
 
-        # --- Configure torch.compile for async TP ---
         torch._inductor.config._micro_pipeline_tp = True
         print("[Debug] torch.compile micro-pipeline async-TP mode enabled.")
 
-        # --- Move model to GPU and prepare TP ---
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
         model = setup_tp_model(model, config, local_rank, tp_size, rank, world_size)
 
         # --- Compile the model for async overlapped execution ---
-        # You can compile the whole model, or selectively only TP-heavy parts
         try:
             model = torch.compile(model)
             print("[Debug] Model compiled with torch.compile for async TP.")
@@ -816,11 +398,10 @@ def setup_distributed_model(model, logger, config, local_rank):
             print(f"[Warning] torch.compile(model) failed: {e}")
 
         print("[Debug] async-TP initialization complete (no FSDP/DP applied).")
-
     else:
         raise ValueError(f"Unknown distributed strategy: {strategy_name}")
 
-@torch.compiler.disable
+#@torch.compiler.disable
 def _train(config, logger, tokenizer, device):
   """Main distributed training loop."""
   rank = int(os.environ["RANK"])
@@ -831,10 +412,7 @@ def _train(config, logger, tokenizer, device):
 
   # --- Model ---
   model = Diffusion(config, tokenizer)
-
   train_set, valid_set = dataloader.get_dataloaders(config, tokenizer)
-
-  print(f"Model type before whole setup: {type(model)}")
 
   dp_size = None
   dp_rank = None
@@ -849,7 +427,7 @@ def _train(config, logger, tokenizer, device):
     assert world_size % (tp_size) == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
     dp_size = world_size // (tp_size)
     model = model.to(device_type)
-    model, dp_mesh, tp_mesh, mesh_2d = native_apply_tp_fsdp_with_sp(model, config, tp_size, dp_size)
+    model, dp_mesh, tp_mesh, mesh_2d = apply_native_tp(model, config, tp_size, dp_size)
     torch.cuda.synchronize()
 
     dp_rank = dp_mesh.get_local_rank()
@@ -862,8 +440,6 @@ def _train(config, logger, tokenizer, device):
     model = setup_distributed_model(model, logger, config, local_rank)
     train_sampler = DistributedSampler(train_set, shuffle=True)
     valid_sampler = DistributedSampler(valid_set, shuffle=False)
-
-
 
   print(f"Model type after whole setup: {type(model)}")
   # --- Setup DDP DataLoaders ---
@@ -889,7 +465,6 @@ def _train(config, logger, tokenizer, device):
     shuffle=False,
     sampler=valid_sampler,
     generator=None)
-  # Will be used in generative perplexity calculation
   valid_loader.tokenizer = tokenizer
   logger.info("Valid loader created and valid tokenizer set is ready")
 
@@ -945,17 +520,6 @@ def _train(config, logger, tokenizer, device):
             
         input_ids = batch['input_ids'].to(device, non_blocking=True)
         attention_mask = batch['attention_mask'].to(device, non_blocking=True)
-        if config.strategy.name in ('3d',):
-            input_ids = DTensor.from_local(
-                input_ids, 
-                mesh_2d, 
-                placements=[Shard(0), Replicate()]
-            )
-            attention_mask = DTensor.from_local(
-                attention_mask, 
-                mesh_2d, 
-                placements=[Shard(0), Replicate()]
-            )
 
         optimizer.zero_grad()
         if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
@@ -986,8 +550,18 @@ def _train(config, logger, tokenizer, device):
         loss = loss_obj.loss
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if config.strategy.name == '3d':
+            local_grads = [p.grad for p in model.parameters()
+               if p.grad is not None and not isinstance(p.grad, DTensor)]
+
+            for g in local_grads:
+                dist.all_reduce(g, op=dist.ReduceOp.AVG)
+
+        clip_grad_norm_hybrid(model.parameters(), 1.0)
+
         optimizer.step()
+
         scheduler.step()
 
         if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
@@ -1050,7 +624,7 @@ def _train(config, logger, tokenizer, device):
 def main(config):
   """Main entry point for DDP training."""
   # DDP is assumed to be used if this script is run
-  use_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+  use_ddp = int(os.environ.get("WORLD_SIZE", 1)) >= 1
   if use_ddp:
       setup_ddp()
   
@@ -1069,7 +643,7 @@ def main(config):
     _train(config, logger, tokenizer, device)
   else:
       if is_main_process():
-          logger.warning("sample_eval and ppl_eval modes are not configured for DDP. Please run them on a single GPU using main_native.py.")
+          logger.warning("sample_eval and ppl_eval modes are not configured yet")
 
   if use_ddp:
       cleanup_ddp()

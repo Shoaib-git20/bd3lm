@@ -3,7 +3,7 @@ type: ddit
 hidden_size: 256
 cond_dim: 64
 length: 1024
-n_blocks: 2 #8
+n_blocks: 2
 n_heads: 8
 scale_by_sigma: True
 dropout: 0.1

@@ -108,14 +108,6 @@ def get_bias_dropout_add_scale(training):
 def modulate(x: torch.Tensor,
              shift: torch.Tensor,
              scale: torch.Tensor) -> torch.Tensor:
-  if isinstance(x, DTensor):
-    x_local = x.to_local()
-    shift_local = shift.to_local() if isinstance(shift, DTensor) else shift
-    scale_local = scale.to_local() if isinstance(scale, DTensor) else scale
-    
-    out_local = x_local * (1 + scale_local) + shift_local
-    
-    return DTensor.from_local(out_local, x.device_mesh, x.placements)
   return x * (1 + scale) + shift
 
 @torch.jit.script
@@ -236,11 +228,27 @@ class LayerNorm(nn.Module):
     super().__init__()
     self.weight = nn.Parameter(torch.ones([dim]))
     self.dim = dim
+
   def forward(self, x):
+    mesh = None
+    placements = None
+    if isinstance(x, DTensor):
+      mesh = x.device_mesh
+      placements = x.placements
+      x = x.to_local()
+
     with torch.amp.autocast('cuda', enabled=False):
       x = F.layer_norm(x.float(), [self.dim])
-    return x * self.weight[None, None, :]
 
+    w = self.weight
+    if isinstance(w, DTensor):
+      w = w.to_local()
+    out = x * w[None, None, :]
+
+    if mesh is not None:
+      out = DTensor.from_local(out, mesh, placements)
+
+    return out
 
 def residual_linear(x, W, x_skip, residual_scale):
   """x_skip + residual_scale * W @ x"""
@@ -466,6 +474,7 @@ class DiTAttention(nn.Module):
       self.block_size = block_size
       self.attn_backend = attn_backend
       self.n = n
+      self.head_dim = dim // n_heads
 
     def get_qkv(self, x, rotary_cos_sin, store_kv=False, kv_cache=None, cache_idx=0):
     # compute qkv (potentially use cache)
@@ -654,6 +663,11 @@ class DDiTBlock(nn.Module):
           return DTensor.from_local(t, target_mesh, placements)
       
       chunks = tuple(map(to_dt, chunks))
+    elif not isinstance(x, DTensor) and chunks is not None:
+        def to_local(t):
+            return t.to_local() if isinstance(t, DTensor) else t
+        
+        chunks = tuple(map(to_local, chunks))
 
     if chunks is not None:
       (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) = chunks
@@ -832,6 +846,9 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     
     x = self.vocab_embed(indices)
 
+    #if isinstance(indices, DTensor) and not isinstance(x, DTensor):
+    #  x = DTensor.from_local(x, indices.device_mesh, [Replicate(),Replicate()])
+
     if sigma is None:
       t_cond = None
     else:
@@ -884,6 +901,11 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       rotary_cos_sin = self.rotary_emb(x_full)
       mask = None
+
+    #if isinstance(x, DTensor):
+    #  print("DDiT forward input is DTensor")
+    #else:
+    #  print("DDiT forward input is Tensor")
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
