@@ -1,4 +1,5 @@
 import os
+import time
 import fsspec
 import hydra
 import omegaconf
@@ -58,12 +59,12 @@ class Loss:
   token_mask: torch.FloatTensor
 
 # DDP Setup
-def setup_ddp():
+def setup_distributed():
     """Initializes the distributed process group."""
     dist.init_process_group(backend="nccl")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-def cleanup_ddp():
+def cleanup_distributed():
     """Cleans up the distributed process group."""
     dist.destroy_process_group()
 
@@ -212,53 +213,37 @@ def _train(config, logger, tokenizer, device):
   local_rank = int(os.environ["LOCAL_RANK"])
   
   if is_main_process():
-      logger.info(f'Starting {config.strategy.name} Training with world size {os.environ["WORLD_SIZE"]}.')
+      logger.info(f'Starting {config.strategy.name} training with world size {os.environ["WORLD_SIZE"]}.')
+
+  seed = config.seed
+  torch.manual_seed(seed)
+  torch.cuda.manual_seed(seed)
+  torch.cuda.manual_seed_all(seed)
 
   # --- Model ---
   model = Diffusion(config, tokenizer)
-  train_set, valid_set = dataloader.get_dataloaders(config, tokenizer)
+  model = model.to(device)
 
-  dp_size = None
-  dp_rank = None
   tp_mesh = None
-  dp_mesh = None
-  mesh_2d = None
-  device_type = torch.accelerator.current_accelerator().type
   
   if config.strategy.name == 'tp':
     world_size = dist.get_world_size()
-    tp_size = 4
-    assert world_size % (tp_size) == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
-    dp_size = world_size // (tp_size)
-    model = model.to(device_type)
-    model, dp_mesh, tp_mesh, mesh_2d = apply_native_tp(model, config, tp_size, dp_size)
-    device_type = torch.accelerator.current_accelerator().type
+    tp_size = world_size
     if is_main_process():
-        print(f"[Debug][3D] Initializing 2D device mesh with shape ({dp_size}, {tp_size})")
+        print(f"[Debug][TP] World size: {world_size}, TP size: {tp_size}, device: {device}")
+    tp_mesh = init_device_mesh(device.type, (tp_size,))
+    if is_main_process():
+        print(f"[Debug][TP] Device mesh initialized: {tp_mesh}")
     
-    mesh_2d = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-
-    if is_main_process():
-        print(f"[Debug][3D] Device mesh initialized: {mesh_2d}")
-
-    tp_mesh = mesh_2d["tp"]
-    dp_mesh = mesh_2d["dp"]
-
+    # --- Define TP plan ---
     tp_plan = {
         "backbone.vocab_embed.embedding": RowwiseParallel(input_layouts=Replicate(),),
-
-        # "backbone.output_layer.norm_final": SequenceParallel(sequence_dim=1),
-
-        # "backbone.output_layer.linear": PrepareModuleInput(
-        #     input_layouts=Shard(1), 
-        #     desired_input_layouts=Replicate()
-        # ),
         "backbone.output_layer.linear": ColwiseParallel(
             output_layouts=Replicate()
         ),
     }
 
-    # --- Looping over DiT Blocks ---
+    ## --- Looping over DiT Blocks ---
     n_blocks = len(model.backbone.blocks)
     for i in range(n_blocks):
         p = f"backbone.blocks.{i}"
@@ -272,35 +257,31 @@ def _train(config, logger, tokenizer, device):
 
     parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
     torch.cuda.synchronize()
-
-    #model = fully_shard(model, mesh=dp_mesh)
-    torch.cuda.synchronize()
-    dp_rank = dp_mesh.get_local_rank()
-    torch.manual_seed(dp_rank + 100)
-    summarize_param_types(model)
-
-    train_sampler = DistributedSampler(train_set, num_replicas=dp_size, rank=dp_rank, shuffle=True)
-    valid_sampler = DistributedSampler(valid_set, num_replicas=dp_size, rank=dp_rank, shuffle=False)
-  elif config.strategy.name == 'ddp':
-    model = DDP(model.to(local_rank), device_ids=[local_rank])
-    train_sampler = DistributedSampler(train_set, shuffle=True)
-    valid_sampler = DistributedSampler(valid_set, shuffle=False)
+    if is_main_process():
+        print(f"[Debug][TP] Model parallelized according to TP plan. Uncomment the debug line at 259 main_tp.py to see parameter types.")
+    #summarize_param_types(model)
   else:
-    raise ValueError(f"Unknown distributed strategy: {strategy_name}")
+    raise ValueError(f"Not/Unknown distributed strategy {strategy_name} for main_tp.py file type")
 
-  print(f"Model type after whole setup: {type(model)}")
+  if is_main_process():
+    print(f"Model type after whole setup: {type(model)}")
+
   # --- Setup DataLoaders ---
 
+  train_set, valid_set = dataloader.get_dataloaders(config, tokenizer)
+
+  generator = torch.Generator()
+  generator.manual_seed(config.seed)
+
   train_loader = torch.utils.data.DataLoader(
-    train_set,
-    batch_size=config.loader.batch_size,
-    num_workers=config.loader.num_workers,
-    pin_memory=config.loader.pin_memory,
-    #shuffle=not config.data.streaming and train_sampler is None,
-    shuffle=False,
-    sampler=train_sampler,
-    persistent_workers=True)
-  
+      train_set,
+      batch_size=config.loader.batch_size,
+      shuffle=True,
+      generator=generator,
+      num_workers=config.loader.num_workers,
+      pin_memory=config.loader.pin_memory,
+      persistent_workers=True,
+  )
   train_loader.tokenizer = tokenizer
   logger.info("Train loader created and train tokenizer set is ready")
 
@@ -310,8 +291,7 @@ def _train(config, logger, tokenizer, device):
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
     shuffle=False,
-    sampler=valid_sampler,
-    generator=None)
+    generator=generator,)
   valid_loader.tokenizer = tokenizer
   logger.info("Valid loader created and valid tokenizer set is ready")
 
@@ -350,22 +330,23 @@ def _train(config, logger, tokenizer, device):
   # --- Training Loop ---
   max_steps = config.trainer.max_steps
   training_complete = False
+  start_time = time.time()
+  step_start_time = time.time()
 
   if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
     model.sampling_eps_min = torch.tensor(config.training.sampling_eps_min)
     model.sampling_eps_max = torch.tensor(config.training.sampling_eps_max)
 
   for epoch in range(start_epoch, 1000): # Loop for a large number of epochs
-    train_sampler.set_epoch(epoch)
     model.train()
     
     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Training]", disable=not is_main_process())
-    
     for batch in train_pbar:
         if current_step >= max_steps:
             training_complete = True
             break
-            
+        iter_start = time.time()
+
         input_ids = batch['input_ids'].to(device, non_blocking=True)
         attention_mask = batch['attention_mask'].to(device, non_blocking=True)
 
@@ -419,10 +400,32 @@ def _train(config, logger, tokenizer, device):
             if model.module.ema:
                 model.module.ema.update(model.parameters())
 
+        iter_end = time.time()
+        iter_time = iter_end - iter_start
+        tokens_processed = input_ids.numel() 
+        tps = tokens_processed / iter_time
+        
         current_step += 1
+        
         if is_main_process():
-            train_pbar.set_postfix({"loss": loss.item(), "lr": scheduler.get_last_lr()[0], "step": current_step})
+            loss_val = loss.item()
+            lr_val = scheduler.get_last_lr()[0]
+            
+            # Print to TQDM bar
+            train_pbar.set_postfix({
+                "loss": f"{loss_val:.4f}", 
+                "lr": f"{lr_val:.2e}", 
+                "step": current_step,
+                "ms/it": f"{iter_time*1000:.1f}"
+            })
 
+            # Log to WandB or File Logger (Every 10 steps to reduce I/O)
+            if current_step % 10 == 0:
+                 logger.info(
+                    f"Step {current_step} | Epoch {epoch+1} | "
+                    f"Loss: {loss_val:.4f} | LR: {lr_val:.6f} | "
+                    f"Time: {iter_time*1000:.2f}ms | Tokens/s: {tps:.0f}"
+                )
     # --- Validation ---
     #model.eval()
     #val_loss = 0
@@ -471,17 +474,15 @@ def _train(config, logger, tokenizer, device):
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
   """Main entry point for DDP training."""
-  # DDP is assumed to be used if this script is run
-  use_ddp = int(os.environ.get("WORLD_SIZE", 1)) >= 1
-  if use_ddp:
-      setup_ddp()
   
-  # Ensure each process has a different seed
-  seed = config.seed + int(os.environ.get("RANK", 0))
-  torch.manual_seed(seed)
+  use_distributed = int(os.environ.get("WORLD_SIZE", 1)) >= 1
+  if is_main_process():
+      print("Distributed training:", use_distributed)
+  if use_distributed:
+      setup_distributed()
   
   logger = utils.get_logger(__name__)
-  device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}") if use_ddp else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}") if use_distributed else torch.device("cuda" if torch.cuda.is_available() else "cpu")
   tokenizer = dataloader.get_tokenizer(config)
 
   if is_main_process():
@@ -493,8 +494,8 @@ def main(config):
       if is_main_process():
           logger.warning("sample_eval and ppl_eval modes are not configured yet")
 
-  if use_ddp:
-      cleanup_ddp()
+  if use_distributed:
+      cleanup_distributed()
 
 if __name__ == '__main__':
   main()
