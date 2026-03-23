@@ -1,4 +1,5 @@
 import torch
+from torch.distributed.tensor import DTensor
 
 
 class ExponentialMovingAverage:
@@ -45,7 +46,14 @@ class ExponentialMovingAverage:
     one_minus_decay = 1.0 - decay
     with torch.no_grad():
       parameters = [p for p in parameters if p.requires_grad]
-      for s_param, param in zip(self.shadow_params, parameters):
+      for i, (s_param, param) in enumerate(zip(self.shadow_params, parameters)):
+        if isinstance(param, DTensor) and not isinstance(s_param, DTensor):
+            s_param = param.clone().detach()
+            self.shadow_params[i] = s_param
+        elif s_param.device != param.device:
+            s_param = s_param.to(param.device)
+            self.shadow_params[i] = s_param
+
         s_param.sub_(one_minus_decay * (s_param - param))
 
   def copy_to(self, parameters):

@@ -84,6 +84,7 @@ class CosineDecayWarmupLRScheduler(
     else:
       super().step_update(num_updates=self._last_epoch)
 
+    self._last_lr = [ group["lr"] for group in self.optimizer.param_groups ]
 
 class LoggingContext:
   """Context manager for selective logging."""

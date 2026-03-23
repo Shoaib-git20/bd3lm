@@ -43,6 +43,7 @@ from torch.distributed._symmetric_memory import enable_symm_mem_for_group
 import torch._inductor
 from torch.distributed._tensor import DTensor, Replicate, Shard
 from torch.distributed.fsdp.wrap import wrap as fsdp_wrap
+from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 
 import dataloader
 from diffusion_native import Diffusion
@@ -52,6 +53,30 @@ import metrics
 from dataclasses import dataclass
 import re
 
+def debug_topology_and_network(mesh_2d):
+    global_rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    hostname = dist.gethostname()
+    
+    # Extract the actual global ranks in this GPU's TP and DP groups
+    tp_group = mesh_2d["tp"].get_group()
+    dp_group = mesh_2d["dp"].get_group()
+    
+    tp_ranks = dist.get_process_group_ranks(tp_group)
+    dp_ranks = dist.get_process_group_ranks(dp_group)
+    
+    # Grab all NCCL environment variables to check the network backend
+    #nccl_env = {k: v for k, v in os.environ.items() if "NCCL" in k}
+    
+    # Print the diagnostics
+    print(f"[Host: {hostname} | Global Rank: {global_rank} | Local Rank: {local_rank}] \n"
+          f"  -> TP Ranks (must be on same host!): {tp_ranks}\n"
+          f"  -> DP Ranks (cross-host is fine): {dp_ranks}\n"
+          #f"  -> NCCL Env: {nccl_env}\n"
+          f"-"*60)
+    
+    # Force all GPUs to wait so the prints don't scramble
+    dist.barrier()
 
 @dataclass
 class Loss:
@@ -159,13 +184,6 @@ def clip_grad_norm_hybrid(parameters, max_norm, norm_type=2.0, tp_size=1):
 
     return total_norm
 
-def print_model_parameters(model):
-  total_params = sum(p.numel() for p in model.parameters())
-  trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-  
-  print(f"Total Parameters: {total_params:,}")
-  print(f"Trainable Parameters: {trainable_params:,}")
-
 def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: bool = True) -> None:
   """Prints content of DictConfig using Rich library on the main process."""
   if not is_main_process():
@@ -240,30 +258,38 @@ def _train(config, logger, tokenizer, device, nvml_handle):
       logger.info(f'Starting {config.strategy.name} training with world size {os.environ["WORLD_SIZE"]}.')
 
   seed = config.seed
-  torch.manual_seed(seed)
-  torch.cuda.manual_seed(seed)
-  torch.cuda.manual_seed_all(seed)
+  #torch.manual_seed(seed)
+  #torch.cuda.manual_seed(seed)
+  #torch.cuda.manual_seed_all(seed)
 
   # --- Model ---
   model = Diffusion(config, tokenizer)
   model = model.to(device)
 
-  print_model_parameters(model)
-
   tp_mesh = None
+  dp_mesh = None
   
-  if config.strategy.name == 'tp':
+  if config.strategy.name == '3d':
+    # -------------------------------------------------
+    # APPLY TPARALLELISM TO MODEL
+    # -------------------------------------------------
     world_size = dist.get_world_size()
-    tp_size = world_size
+    tp_size = config.strategy.tp_degree
+    dp_size = config.strategy.dp_degree
     if is_main_process():
-        logger.info(f"[TP] World size: {world_size}, TP size: {tp_size}, device: {device}")
-    tp_mesh = init_device_mesh(device.type, (tp_size,))
+        logger.info(f"[TP] World size: {world_size}, TP size: {tp_size}, DP size: {dp_size}, device type {device.type}")
+    mesh_2d = init_device_mesh(device.type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+    tp_mesh = mesh_2d["tp"]
+    dp_mesh = mesh_2d["dp"]
+
     if is_main_process():
-        print(f"[Debug][TP] Device mesh initialized: {tp_mesh}")
+        print(f"[Debug][3d] Device mesh initialized: {mesh_2d}\n - TP mesh: {tp_mesh}\n - DP mesh: {dp_mesh}")
     
     # --- Define TP plan ---
     tp_plan = {
         "backbone.vocab_embed.embedding": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False),
+        "backbone.sigma_map.mlp.0": ColwiseParallel(),
+        "backbone.sigma_map.mlp.2": RowwiseParallel(),
         "backbone.output_layer.adaLN_modulation": ColwiseParallel(input_layouts=Replicate(), use_local_output=False),
         "backbone.output_layer.norm_final": SequenceParallel(),
         "backbone.output_layer.linear": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
@@ -295,13 +321,57 @@ def _train(config, logger, tokenizer, device, nvml_handle):
         tp_plan[f"{p}.mlp.w2"] = RowwiseParallel(use_local_output=False)
 
     parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
-    torch.cuda.synchronize()
     if is_main_process():
-        print(f"[Debug][TP] Model parallelized according to TP plan. Uncomment the debug line at 292 main_tp.py to see parameter types.")
-    #summarize_param_types(model)
-  else:
-    raise ValueError(f"Not/Unknown distributed strategy {strategy_name} for main_tp.py file type")
+        print("[Debug] Tensor Parallelism applied")
 
+    # -------------------------------------------------
+    # APPLY FSDP SHARDING ON TOP OF TP-PARALLELIZED MODEL
+    # -------------------------------------------------
+
+    fsdp_config = {
+        "mesh": dp_mesh,
+        "reshard_after_forward": False,
+    }
+
+    # shard embedding
+    fully_shard(
+        model.backbone.vocab_embed.embedding,
+        **fsdp_config,
+    )
+
+    # shard each transformer block
+    for block in model.backbone.blocks:
+        fully_shard(
+            block,
+            **fsdp_config,
+        )
+
+    # shard output layers
+    fully_shard(
+        [
+            model.backbone.output_layer.norm_final,
+            model.backbone.output_layer.linear,
+        ],
+        **fsdp_config,
+    )
+
+    # final root wrap
+    fully_shard(model.backbone, **fsdp_config)
+
+    torch.cuda.synchronize()
+
+    if is_main_process():
+        print("[Debug][3d] Applied TP + FSDP to model")
+
+    #summarize_param_types(model)
+
+    #debug_topology_and_network(mesh_2d)
+
+    if is_main_process():
+        print(f"[Debug][3d] Model parallelized according to TP plan. Uncomment the debug line at 366 in main_3d.py to see parameter types.")
+
+  else:
+    raise ValueError(f"Not/Unknown distributed strategy {strategy_name} for main_3d.py file type")
   if is_main_process():
     print(f"Model type after whole setup: {type(model)}")
 
@@ -313,15 +383,18 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   # --- Setup DataLoaders ---
 
   train_set, valid_set = dataloader.get_dataloaders(config, tokenizer)
+  dp_rank = dp_mesh.get_local_rank()
+  dp_world_size = dp_mesh.size()
 
-  generator = torch.Generator()
-  generator.manual_seed(config.seed)
+  train_sampler = DistributedSampler( train_set, num_replicas=dp_world_size, rank=dp_rank, shuffle=True )
+  valid_sampler = DistributedSampler( valid_set, num_replicas=dp_world_size, rank=dp_rank, shuffle=False )
+
+  torch.manual_seed(config.seed)
 
   train_loader = torch.utils.data.DataLoader(
       train_set,
       batch_size=config.loader.batch_size,
-      shuffle=True,
-      generator=generator,
+      sampler=train_sampler,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       persistent_workers=True,
@@ -332,10 +405,11 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   valid_loader = torch.utils.data.DataLoader(
     valid_set,
     batch_size=config.loader.eval_batch_size,
+    sampler=valid_sampler,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
     shuffle=False,
-    generator=generator,)
+    )
   valid_loader.tokenizer = tokenizer
   logger.info("Valid loader created and valid tokenizer set is ready")
 
@@ -383,86 +457,84 @@ def _train(config, logger, tokenizer, device, nvml_handle):
     model.sampling_eps_max = torch.tensor(config.training.sampling_eps_max)
 
   for epoch in range(start_epoch, 1000): # Loop for a large number of epochs
+    train_sampler.set_epoch(epoch)
     model.train()
-    optimizer.zero_grad()
     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Training]", disable=not is_main_process())
-    
-    for batch in train_pbar:
+    with profile(
+      activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+      schedule=schedule(wait=1, warmup=2, active=3, repeat=1),
+      on_trace_ready=tensorboard_trace_handler('./profiler_logs/run_2node_tp4_dp2'),
+      record_shapes=False,
+      profile_memory=True,
+      with_stack=True 
+    ) as prof:
+      for batch in train_pbar:
         if current_step >= max_steps:
-            training_complete = True
-            break
-        if (current_step + 1) % accumulation_steps == 1 or accumulation_steps == 1:
-            iter_start = time.time()
-
-        input_ids = batch['input_ids'].to(device, non_blocking=True)
-        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
-
-        optimizer.zero_grad()
-        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
-            if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
-              sampling_eps_min = model.sampling_eps_min.item()
-              sampling_eps_max = model.sampling_eps_max.item()
-            elif not hasattr(model, 'sampling_eps_min'):
-              sampling_eps_min = 1e-3
-              sampling_eps_max = 1.0
-
-            (input_tokens, output_tokens, attention_mask) = model._maybe_sub_sample(input_ids, attention_mask)
-
-            if model.parameterization == 'ar':
-              output = model.forward(input_tokens, None)
-              loss = - output.gather(-1, output_tokens[:, :, None])[:, :, 0]
-            else:
-              loss = model._forward_pass_diffusion(
-                        input_tokens, sampling_eps_min=sampling_eps_min, sampling_eps_max=sampling_eps_max)
-            if model.ignore_bos and not model.training:
-                attention_mask[:, 0] = 0
-
-            nlls = (loss * attention_mask)
-            token_nll = nlls.sum() / attention_mask.sum()
-            loss_obj = Loss(loss=token_nll, nlls=nlls, token_mask=attention_mask)
-        else:
-            loss_obj = model.module.compute_loss(input_ids, attention_mask)
-        
-        loss = loss_obj.loss
-        loss = loss / accumulation_steps
-        loss.backward()
-
-        clip_grad_norm_hybrid(model.parameters(), 1.0, tp_size=tp_size)
-
-        if (current_step + 1) % accumulation_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad()
-
-            # ---- GPU utilization sampling ----
-            util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
-            max_gpu_util = max(max_gpu_util, util.gpu)
-            max_mem_util = max(max_mem_util, util.memory)
-    
-            scheduler.step()
-    
+          training_complete = True
+          break
+        with record_function("train_step"):
+          iter_start = time.time()
+          with record_function("data_transfer"):
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+          with record_function("forward_pass"):
             if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
+              if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
+                sampling_eps_min = model.sampling_eps_min.item()
+                sampling_eps_max = model.sampling_eps_max.item()
+              elif not hasattr(model, 'sampling_eps_min'):
+                sampling_eps_min = 1e-3
+                sampling_eps_max = 1.0
+              (input_tokens, output_tokens, attention_mask) = model._maybe_sub_sample(input_ids, attention_mask)
+              if model.parameterization == 'ar':
+                output = model.forward(input_tokens, None)
+                loss = - output.gather(-1, output_tokens[:, :, None])[:, :, 0]
+              else:
+                loss = model._forward_pass_diffusion(
+                          input_tokens, sampling_eps_min=sampling_eps_min, sampling_eps_max=sampling_eps_max)
+              if model.ignore_bos and not model.training:
+                attention_mask[:, 0] = 0
+              nlls = (loss * attention_mask)
+              token_nll = nlls.sum() / attention_mask.sum()
+              loss_obj = Loss(loss=token_nll, nlls=nlls, token_mask=attention_mask)
+            else:
+              loss_obj = model.module.compute_loss(input_ids, attention_mask)
+            loss = loss_obj.loss
+          with record_function("backward_pass"):
+            loss.backward()
+            clip_grad_norm_hybrid(model.parameters(), 1.0, tp_size=tp_size)
+          if (current_step + 1) % accumulation_steps == 0:
+            with record_function("optimizer_step"):
+              optimizer.step()
+              optimizer.zero_grad()
+            with record_function("lr_scheduler_step"):
+              scheduler.step()
+            with record_function("ema_update"):
+              if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
                 if model.ema:
                     model.ema.update(model.parameters())
-            else:
+              else:
                 if model.module.ema:
                     model.module.ema.update(model.parameters())
-    
-            iter_end = time.time()
-            iter_time = iter_end - iter_start
-            tokens_processed = input_ids.numel()*accumulation_steps 
-            tps = tokens_processed / iter_time
-            
-            if is_main_process():
+          
+            with record_function("log_metrics"):
+              # ---- GPU utilization sampling ----
+              util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+              max_gpu_util = max(max_gpu_util, util.gpu)
+              max_mem_util = max(max_mem_util, util.memory)
+              iter_end = time.time()
+              iter_time = iter_end - iter_start
+              tokens_processed = input_ids.numel()*accumulation_steps 
+              tps = tokens_processed / iter_time
+              if is_main_process():
                 loss_val = loss.item()*accumulation_steps
                 lr_val = scheduler.get_last_lr()[0]
-                
                 train_pbar.set_postfix({
                     "loss": f"{loss_val:.4f}", 
                     "lr": f"{lr_val:.2e}", 
                     "step": current_step,
                     "ms/it": f"{iter_time*1000:.1f}"
                 })
-    
                 logger.info(
                     f"Step {current_step} | Epoch {epoch+1} | "
                     f"Loss: {loss_val:.4f} | LR: {lr_val:.6f} | "
@@ -473,8 +545,14 @@ def _train(config, logger, tokenizer, device, nvml_handle):
                     f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB | "
                     f"GPU util: {util.gpu}% | Mem util: {util.memory}%"
                 )
-
         current_step += 1
+        prof.step()
+    if current_step >= max_steps:
+      if is_main_process():
+        logger.info(f"Reached max_steps ({max_steps}). Stopping training.")
+      peak_mem_mb = torch.cuda.max_memory_allocated() / 1024**2
+      logger.info(f"[Rank {dist.get_rank()}] "f"Peak GPU memory allocated: {peak_mem_mb:.2f} MB | "f"Peak GPU util: {max_gpu_util}% | "f"Peak MEM util: {max_mem_util}%")
+      break
 
                 #logger.info(f"memory summary:\n{torch.cuda.memory_summary()}")
     # --- Validation ---
@@ -517,19 +595,6 @@ def _train(config, logger, tokenizer, device, nvml_handle):
         #    }, ckpt_path)
         #    logger.info(f"Checkpoint saved to {ckpt_path}")
 
-    if current_step >= max_steps:
-        if is_main_process():
-            logger.info(f"Reached max_steps ({max_steps}). Stopping training.")
-
-        peak_mem_mb = torch.cuda.max_memory_allocated() / 1024**2
-        logger.info(
-            f"[Rank {dist.get_rank()}] "
-            f"Peak GPU memory allocated: {peak_mem_mb:.2f} MB | "
-            f"Peak GPU util: {max_gpu_util}% | "
-            f"Peak MEM util: {max_mem_util}%"
-        )
-        break
-
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
   """Main entry point for DDP training."""
@@ -540,7 +605,7 @@ def main(config):
   if use_distributed:
       setup_distributed()
   
-  torch.cuda.empty_cache()
+  # torch.cuda.empty_cache()
   # ---- NVML INIT (per process / per rank) ----
   pynvml.nvmlInit()
   local_rank = int(os.environ["LOCAL_RANK"])
@@ -559,11 +624,11 @@ def main(config):
       if is_main_process():
           logger.warning("sample_eval and ppl_eval modes are not configured yet")
 
-  if use_distributed:
-      cleanup_distributed()
+  #if use_distributed:
+  #    cleanup_distributed()
 
   pynvml.nvmlShutdown()
-  torch.cuda.empty_cache()
+  # torch.cuda.empty_cache()
 
 if __name__ == '__main__':
   main()

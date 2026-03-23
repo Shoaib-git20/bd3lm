@@ -40,9 +40,6 @@ class ToDTensorBarrier(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # grad_output is a DTensor (coming from the training loop).
-        # CRITICAL FIX: We explicitly unwrap the gradient to Local
-        # before letting it flow back into the local loss calculation.
         if isinstance(grad_output, DTensor):
             grad_local = grad_output.to_local()
         else:
@@ -68,17 +65,13 @@ def _compute_local_loss_eager(model_output, x0, loss_scale):
       x0_local = x0
       
   if hasattr(loss_scale, "to_local"):
-      scale_local = loss_scale.to_local()
+      loss_scale_local = loss_scale.to_local()
   else:
-      scale_local = loss_scale
+      loss_scale_local = loss_scale
 
-  log_p_theta = torch.gather(
-      input=out_local, 
-      dim=-1, 
-      index=x0_local[:, :, None]
-  ).squeeze(-1)
+  log_p_theta = torch.gather(input=out_local, dim=-1, index=x0_local[:, :, None]).squeeze(-1)
   
-  loss_local = scale_local * log_p_theta
+  loss_local = loss_scale_local * log_p_theta
   return loss_local
 
 @dataclass
@@ -586,12 +579,7 @@ class Diffusion(torch.nn.Module):
 
   def _sample_t(
       self, x0, device, sampling_eps_min, sampling_eps_max, block_size=None):
-    if isinstance(x0, DTensor):
-        local_batch_size = x0.to_local().shape[0]
-        batch_dims = list(x0.shape) 
-        batch_dims[0] = local_batch_size 
-    else:
-        batch_dims = x0.shape
+    batch_dims = x0.shape
 
     if block_size is None:
       block_size = self.block_size
@@ -640,7 +628,6 @@ class Diffusion(torch.nn.Module):
 
     loss_scale, p = self.noise(t)
 
-    dp_rank, local_bs = None, None
     sigma = self._sigma_from_p(p[:,0].unsqueeze(-1))
     dsigma = - loss_scale * torch.expm1(sigma)
 
@@ -658,28 +645,15 @@ class Diffusion(torch.nn.Module):
     x_input = xt
     if self.cross_attn:
       x_input = torch.cat((xt, x0), dim=-1)
-
-    #if isinstance(x0, DTensor):
-    #  print("Using x0 DTensor forward pass")
-    #
-    #if isinstance(xt, DTensor):
-    #  print("Using xt DTensor forward pass")
-    #
-    #if isinstance(x_input, DTensor):
-    #  print("Using x_input DTensor forward pass")
     
     model_output = self.forward(x_input, sigma=sigma)
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
       return dsigma * self._score_entropy(model_output_local, sigma, xt_local, x0_local)
-    
-    loss_local = _compute_local_loss_eager(model_output, x0, loss_scale)
 
-    if isinstance(x0, DTensor):
-        loss = ToDTensorBarrier.apply(loss_local, x0.device_mesh, x0.placements)
-    else:
-        loss = loss_local
+    log_p_theta = torch.gather(input=model_output, dim=-1, index=x0[:, :, None]).squeeze(-1)
+    loss = log_p_theta * loss_scale
     
     return loss
 

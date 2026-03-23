@@ -1,10 +1,10 @@
 name: medium
 type: ddit
-hidden_size: 1024
-cond_dim: 128
+hidden_size: 8192
+cond_dim: 256
 length: 1024
-n_blocks: 24
-n_heads: 16
+n_blocks: 14
+n_heads: 32
 scale_by_sigma: True
 dropout: 0.1
 tie_word_embeddings: True
