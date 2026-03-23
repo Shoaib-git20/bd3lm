@@ -265,21 +265,13 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   if is_main_process():
       logger.info(f'Starting {config.strategy.name} training with world size {os.environ["WORLD_SIZE"]}.')
 
-  seed = config.seed
-  #torch.manual_seed(seed)
-  #torch.cuda.manual_seed(seed)
-  #torch.cuda.manual_seed_all(seed)
-
   # --- Model ---
   model = Diffusion(config, tokenizer)
   model = model.to(device)
   if is_main_process():
     print_model_parameters(model)
 
-  # -------------------------------------------------
-  # APPLY DISTRIBUTED STRATEGY
-  # -------------------------------------------------
-  # We pass the logger and parallelize_py only prints on rank 0.
+  # -----  APPLY DISTRIBUTED STRATEGY -----
   tp_mesh = None
   dp_mesh = None
   model, tp_mesh, dp_mesh = parallelize_model(
@@ -289,109 +281,6 @@ def _train(config, logger, tokenizer, device, nvml_handle):
       is_main_process=is_main_process(),
       logger=logger
   )
-    
-  #if config.strategy.name == '3d':
-  #  # -------------------------------------------------
-  #  # APPLY TPARALLELISM TO MODEL
-  #  # -------------------------------------------------
-  #  world_size = dist.get_world_size()
-  #  tp_size = config.strategy.tp_degree
-  #  dp_size = config.strategy.dp_degree
-  #  if is_main_process():
-  #      logger.info(f"[TP] World size: {world_size}, TP size: {tp_size}, DP size: {dp_size}, device type {device.type}")
-  #  mesh_2d = init_device_mesh(device.type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-  #  tp_mesh = mesh_2d["tp"]
-  #  dp_mesh = mesh_2d["dp"]
-#
-  #  if is_main_process():
-  #      print(f"[Debug][3d] Device mesh initialized: {mesh_2d}\n - TP mesh: {tp_mesh}\n - DP mesh: {dp_mesh}")
-  #  
-  #  # --- Define TP plan ---
-  #  tp_plan = {
-  #      "backbone.vocab_embed.embedding": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False),
-  #      "backbone.sigma_map.mlp.0": ColwiseParallel(),
-  #      "backbone.sigma_map.mlp.2": RowwiseParallel(),
-  #      "backbone.output_layer.adaLN_modulation": ColwiseParallel(input_layouts=Replicate(), use_local_output=False),
-  #      "backbone.output_layer.norm_final": SequenceParallel(),
-  #      "backbone.output_layer.linear": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
-  #  }
-#
-  #  ## --- Looping over DiT Blocks ---
-  #  n_blocks = len(model.backbone.blocks)
-  #  for i in range(n_blocks):
-  #      p = f"backbone.blocks.{i}"
-#
-  #      tp_plan[f"{p}.adaLN_modulation"] = ColwiseParallel(input_layouts=Replicate(), use_local_output=False)
-#
-  #      tp_plan[f"{p}.norm1"] = SequenceParallel()
-#
-  #      tp_plan[f"{p}.atten"] = PrepareModuleInput(
-  #          input_layouts=(Shard(1),),
-  #          desired_input_layouts=(Replicate(),),
-  #      )
-#
-  #      tp_plan[f"{p}.atten.attn_qkv"] = ColwiseParallel(use_local_output=False)
-  #      tp_plan[f"{p}.atten.attn_out"] = RowwiseParallel(output_layouts=Shard(1), use_local_output=False)
-  #      
-  #      tp_plan[f"{p}.norm2"] = SequenceParallel()
-  #      tp_plan[f"{p}.mlp"] = PrepareModuleInput(
-  #          input_layouts=(Shard(1),),
-  #          desired_input_layouts=(Replicate(),),
-  #      )
-  #      tp_plan[f"{p}.mlp.w1"] = ColwiseParallel()
-  #      tp_plan[f"{p}.mlp.w2"] = RowwiseParallel(use_local_output=False)
-#
-  #  parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
-  #  if is_main_process():
-  #      print("[Debug] Tensor Parallelism applied")
-#
-  #  # -------------------------------------------------
-  #  # APPLY FSDP SHARDING ON TOP OF TP-PARALLELIZED MODEL
-  #  # -------------------------------------------------
-#
-  #  fsdp_config = {
-  #      "mesh": dp_mesh,
-  #      "reshard_after_forward": True,
-  #  }
-#
-  #  # shard embedding
-  #  fully_shard(
-  #      model.backbone.vocab_embed.embedding,
-  #      **fsdp_config,
-  #  )
-#
-  #  # shard each transformer block
-  #  for block in model.backbone.blocks:
-  #      fully_shard(
-  #          block,
-  #          **fsdp_config,
-  #      )
-#
-  #  # shard output layers
-  #  fully_shard(
-  #      [
-  #          model.backbone.output_layer.norm_final,
-  #          model.backbone.output_layer.linear,
-  #      ],
-  #      **fsdp_config,
-  #  )
-#
-  #  # final root wrap
-  #  fully_shard(model.backbone, **fsdp_config)
-#
-  #  torch.cuda.synchronize()
-#
-  #  if is_main_process():
-  #      print("[Debug][3d] Applied TP + FSDP to model")
-#
-    #summarize_param_types(model)
-
-    #debug_topology_and_network(mesh_2d)
-
-  #else:
-  #  raise ValueError(f"Not/Unknown distributed strategy {strategy_name} for main_3d.py file type")
-  #if is_main_process():
-  #  print(f"Model type after whole setup: {type(model)}")
 
   # ---- GPU utilization trackers ----
   torch.cuda.reset_peak_memory_stats()
@@ -431,7 +320,6 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   logger.info("Valid loader created and valid tokenizer set is ready")
 
   # --- Optimizer, Scheduler ---
-
   optimizer, scheduler = get_optimizer_and_scheduler(model, config)
 
   # --- Checkpointing ---
@@ -608,7 +496,7 @@ def main(config):
   if use_distributed:
       setup_distributed()
   
-  # torch.cuda.empty_cache()
+  torch.cuda.empty_cache()
   # ---- NVML INIT (per process / per rank) ----
   pynvml.nvmlInit()
   local_rank = int(os.environ["LOCAL_RANK"])
@@ -627,11 +515,11 @@ def main(config):
       if is_main_process():
           logger.warning("sample_eval and ppl_eval modes are not configured yet")
 
-  #if use_distributed:
-  #    cleanup_distributed()
+  if use_distributed:
+      cleanup_distributed()
 
   pynvml.nvmlShutdown()
-  # torch.cuda.empty_cache()
+  torch.cuda.empty_cache()
 
 if __name__ == '__main__':
   main()

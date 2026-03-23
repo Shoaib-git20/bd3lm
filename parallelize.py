@@ -3,7 +3,6 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# FSDP (Composable API based on your fully_shard usage)
 from torch.distributed._composable.fsdp import fully_shard 
 
 # Tensor Parallelism

@@ -538,12 +538,12 @@ class DiTAttention(nn.Module):
       B, S, C = x.shape
       if mask is not None and not sample_mode:
         cos, sin = rotary_cos_sin
-        #cos_vec = torch.cat([cos, cos], dim=1) 
-        #sin_vec = torch.cat([sin, sin], dim=1)
-        #qkv = self.get_qkv(x, (cos_vec, sin_vec), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
-        qkv_x = self.get_qkv(x[:,:self.n], (cos, sin), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
-        qkv_x0 = self.get_qkv(x[:,self.n:], (cos, sin), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
-        qkv = torch.cat((qkv_x, qkv_x0), dim=1)
+        cos_vec = torch.cat([cos, cos], dim=1) 
+        sin_vec = torch.cat([sin, sin], dim=1)
+        qkv = self.get_qkv(x, (cos_vec, sin_vec), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        #qkv_x = self.get_qkv(x[:,:self.n], (cos, sin), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        #qkv_x0 = self.get_qkv(x[:,self.n:], (cos, sin), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        #qkv = torch.cat((qkv_x, qkv_x0), dim=1)
       else:
         qkv = self.get_qkv(x, rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
 
