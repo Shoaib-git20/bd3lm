@@ -1,6 +1,3 @@
-import sys
-print(sys.executable)
-
 import os
 import time
 import pynvml
@@ -9,10 +6,7 @@ import hydra
 import omegaconf
 import rich.syntax
 import rich.tree
-import math
 import torch
-print(f"PyTorch version: {torch.__version__}")
-import torch.nn as nn
 import transformers
 from tqdm import tqdm
 import pandas as pd
@@ -60,63 +54,6 @@ from dataclasses import dataclass
 import re
 from parallelize import parallelize_model
 
-@torch.no_grad()
-def initialize_dit_weights(model):
-    n_layers = model.config.model.n_blocks
-    std = 0.02
-    
-    def get_data(param):
-        return param.to_local() if isinstance(param, DTensor) else param
-
-    # Use named_modules to get full paths like "backbone.blocks.0.atten.attn_out"
-    for name, m in model.named_modules():
-        #print(f"Initializing {name} as {'Scaled' if name.endswith('attn_out') else 'Standard'}")
-        
-        # We only want to initialize leaf-level weight layers (Linear, Embedding, etc.)
-        # Parent modules (like 'backbone.blocks.0.atten') should be skipped.
-        if not isinstance(m, (nn.Linear, nn.Embedding, nn.LayerNorm, nn.GroupNorm)):
-            continue
-
-        # 1. ZERO-INIT: AdaLN & Final Output Head
-        # Matches: "...adaLN_modulation" and "...output_layer.linear"
-        if name.endswith("adaLN_modulation") or name.endswith("output_layer.linear"):
-            nn.init.constant_(get_data(m.weight), 0)
-            if m.bias is not None:
-                nn.init.constant_(get_data(m.bias), 0)
-            continue
-
-        # 2. SCALED INIT (BD3LM): Output Projections
-        # Matches exactly: "...atten.attn_out" and "...mlp.w2"
-        if name.endswith("attn_out") or name.endswith("mlp.w2"):
-            
-            # Scaled std: 0.02 / sqrt(2 * num_layers)
-            scaled_std = std / math.sqrt(2 * n_layers)
-            nn.init.normal_(get_data(m.weight), std=scaled_std)
-            if m.bias is not None:
-                nn.init.constant_(get_data(m.bias), 0)
-            continue
-
-        # 3. STANDARD INIT: All other Linear layers (QKV, mlp.w1, sigma_map)
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(get_data(m.weight), std=std)
-            if m.bias is not None:
-                nn.init.constant_(get_data(m.bias), 0)
-
-        # 4. EMBEDDINGS (Vocab)
-        elif isinstance(m, nn.Embedding):
-            nn.init.trunc_normal_(get_data(m.weight), std=std, a=-2*std, b=2*std)
-
-        # 5. NORMALIZATION (norm1, norm2, norm_final)
-        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
-            nn.init.ones_(get_data(m.weight))
-            if m.bias is not None:
-                nn.init.zeros_(get_data(m.bias))
-
-    # 6. Noise schedule parameters
-    for param in model.noise.parameters():
-        nn.init.constant_(get_data(param), 0)
-
-
 def debug_topology_and_network(mesh_2d):
     global_rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -148,73 +85,11 @@ class Loss:
   nlls: torch.FloatTensor
   token_mask: torch.FloatTensor
 
-def print_root(rank, message):
-    if int(rank) == 0:
-        print("ROOT: " + message, flush=True)
-
 # DDP Setup
-def set_mpi(): # borrowed from deepspeed
-    TORCH_DISTRIBUTED_DEFAULT_PORT = 29500
-    from mpi4py import MPI
-    import subprocess
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    world_size = comm.Get_size()
-
-    master_addr = None
-    if rank == 0:
-        import shlex
-        try:
-            hostname_cmd = shlex.split("hostname -I")
-            result = subprocess.check_output(hostname_cmd)
-            master_addr = result.decode('utf-8').split()[0]
-        except subprocess.CalledProcessError:  # hostname -I not available (e.g. on macOS)
-            import socket
-            master_addr = socket.gethostbyname(socket.gethostname())
-    master_addr = comm.bcast(master_addr, root=0)
-
-    # Determine local rank by assuming hostnames are unique
-    proc_name = MPI.Get_processor_name()
-
-    # gather only on root to avoid per-rank memory blowup
-    all_procs = comm.gather(proc_name, root=0)
-
-    if comm.rank == 0:
-    # compute local rank per global rank
-        local_ranks = []
-        count = {}
-        for h in all_procs:
-            count[h] = count.get(h, 0)
-            local_ranks.append(count[h])
-            count[h] += 1
-    else:
-        local_ranks = None
-
-    local_ranks = comm.bcast(local_ranks, root=0)
-    local_rank = local_ranks[rank]
-
-    #local_rank = sum([i == proc_name for i in all_procs[:rank]])
-
-    os.environ['RANK'] = str(rank)
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['LOCAL_RANK'] = str(local_rank)
-    os.environ['MASTER_ADDR'] = master_addr
-    os.environ['MASTER_PORT'] = str(TORCH_DISTRIBUTED_DEFAULT_PORT)
-
-    print_root(rank,
-    "Discovered MPI settings of world_rank={}, local_rank={}, world_size={}, master_addr={}, master_port={}".
-    format(os.environ['RANK'], os.environ['LOCAL_RANK'], os.environ['WORLD_SIZE'], os.environ['MASTER_ADDR'],
-            os.environ['MASTER_PORT']))
-
 def setup_distributed():
     """Initializes the distributed process group."""
-    if backend == "mpi":
-        set_mpi()
-        dist.init_process_group(backend="mpi")
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    else:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 def cleanup_distributed():
     """Cleans up the distributed process group."""
@@ -296,7 +171,7 @@ def clip_grad_norm_hybrid(parameters, max_norm, norm_type=2.0, tp_size=1):
 
     total_norm = total_sq_norm.pow(1.0 / norm_type)
     if torch.isnan(total_norm) or torch.isinf(total_norm):
-        #print(f"[Warning] Gradient norm is {total_norm}. Skipping clipping.")
+        print(f"[Warning] Gradient norm is {total_norm}. Skipping clipping.")
         return total_norm
     clip_coef = max_norm / (total_norm + 1e-6)
     clip_coef = torch.clamp(clip_coef, max=1.0)
@@ -386,48 +261,32 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   """Main distributed training loop."""
   rank = int(os.environ["RANK"])
   local_rank = int(os.environ["LOCAL_RANK"])
-
-  torch.manual_seed(config.seed)
-  if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(config.seed)
   
   if is_main_process():
       logger.info(f'Starting {config.strategy.name} training with world size {os.environ["WORLD_SIZE"]}.')
 
   # --- Model ---
-  logger.info("Instantiating model on meta device...")
-  with torch.device("meta"):
-    model = Diffusion(config, tokenizer)
-  #model = Diffusion(config, tokenizer)
-
+  model = Diffusion(config, tokenizer)
+  model = model.to(device)
   if is_main_process():
     print_model_parameters(model)
 
   # -----  APPLY DISTRIBUTED STRATEGY -----
   tp_mesh = None
   dp_mesh = None
-  model, tp_mesh, dp_mesh = parallelize_model(
-      model=model,
-      config=config,
-      device=device,
-      is_main_process=is_main_process(),
-      logger=logger
-  )
-
-  #model = model.to(device)
-
-  # --- MATERIALIZE SHARDS ON GPU ---
-  logger.info("Materializing sharded model on GPU...")
-  model.to_empty(device=device)
-
-  # --- INITIALIZE WEIGHTS (BD3LM MATH) ---
-  logger.info("Initializing weights with BD3LM scaled-init...")
-  initialize_dit_weights(model)
   
-  # --- SETUP EMA ---
-  if config.training.ema > 0:
-      logger.info("Initializing EMA for sharded parameters...")
-      model.setup_ema()
+  parallel_out = parallelize_model(
+    model=model,
+    config=config,
+    device=device,
+    is_main_process=is_main_process(),
+    logger=logger
+    )
+
+  if config.strategy.name == 'tp_pp_fsdp':
+      model, schedule, tp_mesh, dp_mesh, pp_mesh = parallel_out
+  else:
+      model, tp_mesh, dp_mesh = parallel_out
 
   # ---- GPU utilization trackers ----
   torch.cuda.reset_peak_memory_stats()
@@ -442,9 +301,11 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   train_sampler = DistributedSampler( train_set, num_replicas=dp_world_size, rank=dp_rank, shuffle=True )
   valid_sampler = DistributedSampler( valid_set, num_replicas=dp_world_size, rank=dp_rank, shuffle=False )
 
+  torch.manual_seed(config.seed)
+
   train_loader = torch.utils.data.DataLoader(
       train_set,
-      batch_size=config.loader.local_batch_size,
+      batch_size=config.loader.batch_size,
       sampler=train_sampler,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
@@ -455,7 +316,7 @@ def _train(config, logger, tokenizer, device, nvml_handle):
 
   valid_loader = torch.utils.data.DataLoader(
     valid_set,
-    batch_size=config.loader.local_eval_batch_size,
+    batch_size=config.loader.eval_batch_size,
     sampler=valid_sampler,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
@@ -502,7 +363,7 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   start_time = time.time()
   step_start_time = time.time()
 
-  if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp'):
+  if config.strategy.name in ('ddp', 'fsdp', 'tp', '3d', 'async_tp', 'tp_pp_fsdp'):
     model.sampling_eps_min = torch.tensor(config.training.sampling_eps_min)
     model.sampling_eps_max = torch.tensor(config.training.sampling_eps_max)
 
@@ -518,8 +379,9 @@ def _train(config, logger, tokenizer, device, nvml_handle):
         iter_start = time.time()
       input_ids = batch['input_ids'].to(device, non_blocking=True)
       attention_mask = batch['attention_mask'].to(device, non_blocking=True)
-    
-      if config.strategy.name in ("ddp","fsdp", "tp", "3d", "2d", "tp_ddp", "tp_pp_fsdp"):
+      if config.strategy.name == 'tp_pp_fsdp':
+        loss = schedule.step(input_ids=input_ids, attention_mask=attention_mask)
+      else :
         if sampling_eps_min is None and hasattr(model, 'sampling_eps_min'):
           sampling_eps_min = model.sampling_eps_min.item()
           sampling_eps_max = model.sampling_eps_max.item()
@@ -538,8 +400,7 @@ def _train(config, logger, tokenizer, device, nvml_handle):
         nlls = (loss * attention_mask)
         token_nll = nlls.sum() / attention_mask.sum()
         loss_obj = Loss(loss=token_nll, nlls=nlls, token_mask=attention_mask)
-      else:
-        loss_obj = model.module.compute_loss(input_ids, attention_mask)
+    
       loss = loss_obj.loss
       loss = loss / accumulation_steps
       loss.backward()
@@ -548,8 +409,12 @@ def _train(config, logger, tokenizer, device, nvml_handle):
         optimizer.step()
         optimizer.zero_grad()
         scheduler.step()
-        if model.ema:
-            model.ema.update(model.parameters())
+        if config.strategy.name in ('fsdp', 'tp', '3d', 'async_tp'):
+          if model.ema:
+              model.ema.update(model.parameters())
+        else:
+          if model.module.ema:
+              model.module.ema.update(model.parameters())
       
         # ---- GPU utilization sampling ----
         util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)

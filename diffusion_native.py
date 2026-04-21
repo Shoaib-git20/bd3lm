@@ -140,12 +140,7 @@ class Diffusion(torch.nn.Module):
 
     self.noise = noise_schedule.get_noise(self.config)
     
-    if self.config.training.ema > 0:
-      self.ema = models.ema.ExponentialMovingAverage(
-        self._get_parameters(),
-        decay=self.config.training.ema)
-    else:
-      self.ema = None
+    self.ema = None
     
     self.var_min = self.config.algo.var_min
     if self.var_min:
@@ -158,6 +153,14 @@ class Diffusion(torch.nn.Module):
 
   def _get_parameters(self):
     return itertools.chain(self.backbone.parameters(), self.noise.parameters())
+  
+  def setup_ema(self):
+    if self.config.training.ema > 0:
+      self.ema = models.ema.ExponentialMovingAverage(
+        self._get_parameters(),
+        decay=self.config.training.ema)
+    else:
+      self.ema = None
 
   def _validate_configuration(self):
     if self.config.mode == 'sample_eval' and self.config.sampling.first_hitting:
@@ -176,12 +179,16 @@ class Diffusion(torch.nn.Module):
       
   def to(self, *args, **kwargs):
     super().to(*args, **kwargs)
-    device = next(self.parameters()).device
+    try:
+        device = next(self.parameters()).device
+    except StopIteration:
+        return self
     if hasattr(self.backbone, "block_diff_mask"):
-        if self.config.model.attn_backend == 'sdpa':
-            self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(device)
-        elif self.config.model.attn_backend == 'flex':
-            self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(device)
+        mask = self.backbone.block_diff_mask if hasattr(self.backbone, "block_diff_mask") else None
+        if self.config.model.attn_backend == 'sdpa' and mask is not None and mask.device.type != "meta" and mask.device != device:
+            self.backbone.block_diff_mask = mask.to(device)
+        elif self.config.model.attn_backend == 'flex' and mask is not None and mask.device.type != "meta" and mask.device != device:
+            self.backbone.block_diff_mask = mask.to(device)
     if hasattr(self, 'sampling_eps_min') and torch.is_tensor(self.sampling_eps_min):
         self.sampling_eps_min = self.sampling_eps_min.to(device)
         self.sampling_eps_max = self.sampling_eps_max.to(device)
@@ -647,7 +654,7 @@ class Diffusion(torch.nn.Module):
       x_input = torch.cat((xt, x0), dim=-1)
     
     model_output = self.forward(x_input, sigma=sigma)
-    utils.print_nans(model_output, 'model_output')
+    #utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
       return dsigma * self._score_entropy(model_output_local, sigma, xt_local, x0_local)

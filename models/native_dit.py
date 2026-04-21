@@ -482,15 +482,15 @@ class DiTAttention(nn.Module):
       if kv_cache is not None:
         new_qkv = self.attn_qkv(x)
 
-        if isinstance(new_qkv, DTensor):
-          new_qkv = new_qkv.to_local()
+        #if isinstance(new_qkv, DTensor):
+        #  new_qkv = new_qkv.to_local()
 
         kv_cache[:, cache_idx:cache_idx+self.block_size] = new_qkv
         qkv = kv_cache[:, :cache_idx+self.block_size].clone()
       else:
         qkv = self.attn_qkv(x)
-        if isinstance(qkv, DTensor):
-          qkv = qkv.to_local()
+        #if isinstance(qkv, DTensor):
+        #  qkv = qkv.to_local()
       
       total_local_dim = qkv.shape[-1]
       local_n_heads = (total_local_dim // 3) // self.head_dim
@@ -537,13 +537,10 @@ class DiTAttention(nn.Module):
     def forward(self, x, rotary_cos_sin, mask=None, causal=False, sample_mode=False, store_kv=False, kv_cache=None, attn_backend='flash_attn', cache_idx=0):
       B, S, C = x.shape
       if mask is not None and not sample_mode:
-        cos, sin = rotary_cos_sin
-        cos_vec = torch.cat([cos, cos], dim=1) 
-        sin_vec = torch.cat([sin, sin], dim=1)
-        qkv = self.get_qkv(x, (cos_vec, sin_vec), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
-        #qkv_x = self.get_qkv(x[:,:self.n], (cos, sin), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
-        #qkv_x0 = self.get_qkv(x[:,self.n:], (cos, sin), store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
-        #qkv = torch.cat((qkv_x, qkv_x0), dim=1)
+        #qkv = self.get_qkv(x, rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        qkv_x = self.get_qkv(x[:,:self.n], rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        qkv_x0 = self.get_qkv(x[:,self.n:], rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
+        qkv = torch.cat((qkv_x, qkv_x0), dim=1)
       else:
         qkv = self.get_qkv(x, rotary_cos_sin, store_kv=store_kv, kv_cache=kv_cache, cache_idx=cache_idx)
 
@@ -638,19 +635,6 @@ class DDiTBlock(nn.Module):
         self.adaLN_modulation(c), '(b h) d -> b h d', b=batch_size
         ).chunk(6, dim=-1)
     
-    #if isinstance(x, DTensor) and chunks is not None:
-    #  target_mesh = x.device_mesh
-    #  x_placements = x.placements
-    #  def to_dt(t):
-    #    if isinstance(t, DTensor):
-    #        return t.redistribute(target_mesh, (Replicate(),))
-    #    return DTensor.from_local(t, target_mesh, (Replicate(),))
-    #  chunks = tuple(map(to_dt, chunks))
-    #elif not isinstance(x, DTensor) and chunks is not None:
-    #    def to_local(t):
-    #        return t.to_local() if isinstance(t, DTensor) else t
-    #    chunks = tuple(map(to_local, chunks))
-
     if chunks is not None:
       (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) = chunks
       shift_msa = shift_msa[:, None, :]
@@ -691,7 +675,6 @@ class DDiTBlock(nn.Module):
       residual = x
       x = self.mlp(modulate_fused(self.norm2(x), shift_mlp, scale_mlp))
       x = bias_dropout_scale_fn(x, None, gate_mlp, residual, self.dropout)
-
     else:
       scale = torch.ones(1, device=x.device, dtype=x.dtype)
       x = bias_dropout_scale_fn(x, None, scale, x_skip, self.dropout)
@@ -739,13 +722,6 @@ class DDiTFinalLayer(nn.Module):
           self.adaLN_modulation(c), '(b h) d -> b h d', b=x.shape[0]).chunk(2, dim=-1)
         shift = shift[:, None, :]
         scale = scale[:, None, :]
-      #if isinstance(x, DTensor):
-      #  def to_dt(t):
-      #    if isinstance(t, DTensor):
-      #        return t.redistribute(x.device_mesh, (Replicate(),))
-      #    return DTensor.from_local(t, x.device_mesh, (Replicate(),))
-      #  shift = to_dt(shift)
-      #  scale = to_dt(scale)
       x = modulate_fused(x, shift, scale)
     x = self.linear(x)
     return x
@@ -838,36 +814,11 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
   def forward(self, indices, sigma, sample_mode=False, store_kv=False):
     
-    #print(f"Input indices type: {type(indices)}, shape: {indices.shape}")
-    #vocab_ref_weight = self.vocab_embed.embedding.weight
-    #if isinstance(vocab_ref_weight, DTensor):
-    #  print(f"vocab embed weights are Dtensor with mesh: {vocab_ref_weight.device_mesh} and placements: {vocab_ref_weight.placements}")
-    #  indices = distribute_tensor(
-    #      indices,
-    #      device_mesh=vocab_ref_weight.device_mesh,
-    #      placements=[Shard(0), Replicate()]
-    # )
-    #print(f"Distributed indices type: {type(indices)}, shape: {indices.shape}")
-
     x = self.vocab_embed(indices)
 
     if sigma is None:
       t_cond = None
     else:
-      #if hasattr(self.sigma_map, 'mlp') and len(self.sigma_map.mlp) > 0:
-      #    ref_weight = self.sigma_map.mlp[0].weight
-      #else:
-      #    ref_weight = next(self.sigma_map.parameters())
-
-      #if isinstance(ref_weight, DTensor):
-      #    sigma_input = distribute_tensor(
-      #        sigma,
-      #        device_mesh=ref_weight.device_mesh,
-      #        placements=ref_weight.placements
-      #    )
-      #else:
-      #    sigma_input = sigma
-      
       t_cond = F.silu(self.sigma_map(sigma))
 
     x_is_seq_sharded = isinstance(x, DTensor) and x.placements[0].is_shard(dim=1)
@@ -897,22 +848,14 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             self.n:self.n+x.shape[1], self.n:self.n+x.shape[1]]
           rotary_cos_sin = self.rotary_emb(x_full, offset=self.n)
       else:
-        rotary_cos_sin = self.rotary_emb(x_full[:, :self.n])
+        cos, sin = self.rotary_emb(x_full[:, :self.n])
+        rotary_cos_sin = (cos, sin) 
+        #cos_vec = torch.cat([cos, cos], dim=1) 
+        #sin_vec = torch.cat([sin, sin], dim=1)
+        #rotary_cos_sin = (cos_vec, sin_vec)
     else:
       rotary_cos_sin = self.rotary_emb(x_full)
       mask = None
-
-    #if isinstance(x, DTensor):
-    #  print("DDiT forward input is DTensor")
-    #else:
-    #  print("DDiT forward input is Tensor")
-
-    #if not isinstance(x, DTensor):
-    #  x = DTensor.from_local(
-    #      x,
-    #      device_mesh=self.vocab_embed.embedding.weight.device_mesh,
-    #      placements=[Shard(1)],
-    #  )
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
       for i in range(len(self.blocks)):

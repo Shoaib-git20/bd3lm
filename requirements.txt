@@ -19,3 +19,4 @@ timm==0.9.16
 transformers==4.49.0
 triton
 wandb==0.19.8
+pynvml

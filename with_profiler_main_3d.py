@@ -7,6 +7,7 @@ import omegaconf
 import rich.syntax
 import rich.tree
 import torch
+import torch.nn as nn
 import transformers
 from tqdm import tqdm
 import pandas as pd
@@ -52,6 +53,68 @@ import utils
 import metrics
 from dataclasses import dataclass
 import re
+import metrics
+from dataclasses import dataclass
+import re
+from parallelize import parallelize_model
+import math
+
+
+@torch.no_grad()
+def initialize_dit_weights(model):
+    n_layers = model.config.model.n_blocks
+    std = 0.02
+    
+    def get_data(param):
+        return param.to_local() if isinstance(param, DTensor) else param
+
+    # Use named_modules to get full paths like "backbone.blocks.0.atten.attn_out"
+    for name, m in model.named_modules():
+        #print(f"Initializing {name} as {'Scaled' if name.endswith('attn_out') else 'Standard'}")
+        
+        # We only want to initialize leaf-level weight layers (Linear, Embedding, etc.)
+        # Parent modules (like 'backbone.blocks.0.atten') should be skipped.
+        if not isinstance(m, (nn.Linear, nn.Embedding, nn.LayerNorm, nn.GroupNorm)):
+            continue
+
+        # 1. ZERO-INIT: AdaLN & Final Output Head
+        # Matches: "...adaLN_modulation" and "...output_layer.linear"
+        if name.endswith("adaLN_modulation") or name.endswith("output_layer.linear"):
+            nn.init.constant_(get_data(m.weight), 0)
+            if m.bias is not None:
+                nn.init.constant_(get_data(m.bias), 0)
+            continue
+
+        # 2. SCALED INIT (BD3LM): Output Projections
+        # Matches exactly: "...atten.attn_out" and "...mlp.w2"
+        if name.endswith("attn_out") or name.endswith("mlp.w2"):
+            
+            # Scaled std: 0.02 / sqrt(2 * num_layers)
+            scaled_std = std / math.sqrt(2 * n_layers)
+            nn.init.normal_(get_data(m.weight), std=scaled_std)
+            if m.bias is not None:
+                nn.init.constant_(get_data(m.bias), 0)
+            continue
+
+        # 3. STANDARD INIT: All other Linear layers (QKV, mlp.w1, sigma_map)
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(get_data(m.weight), std=std)
+            if m.bias is not None:
+                nn.init.constant_(get_data(m.bias), 0)
+
+        # 4. EMBEDDINGS (Vocab)
+        elif isinstance(m, nn.Embedding):
+            nn.init.trunc_normal_(get_data(m.weight), std=std, a=-2*std, b=2*std)
+
+        # 5. NORMALIZATION (norm1, norm2, norm_final)
+        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+            nn.init.ones_(get_data(m.weight))
+            if m.bias is not None:
+                nn.init.zeros_(get_data(m.bias))
+
+    # 6. Noise schedule parameters
+    for param in model.noise.parameters():
+        nn.init.constant_(get_data(param), 0)
 
 def debug_topology_and_network(mesh_2d):
     global_rank = dist.get_rank()
@@ -184,6 +247,13 @@ def clip_grad_norm_hybrid(parameters, max_norm, norm_type=2.0, tp_size=1):
 
     return total_norm
 
+def print_model_parameters(model):
+  total_params = sum(p.numel() for p in model.parameters())
+  trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  
+  print(f"Total Parameters: {total_params:,}")
+  print(f"Trainable Parameters: {trainable_params:,}")
+
 def _print_config(config: omegaconf.DictConfig, resolve: bool = True, save_cfg: bool = True) -> None:
   """Prints content of DictConfig using Rich library on the main process."""
   if not is_main_process():
@@ -257,123 +327,46 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   if is_main_process():
       logger.info(f'Starting {config.strategy.name} training with world size {os.environ["WORLD_SIZE"]}.')
 
-  seed = config.seed
-  #torch.manual_seed(seed)
-  #torch.cuda.manual_seed(seed)
-  #torch.cuda.manual_seed_all(seed)
+  torch.manual_seed(config.seed)
+  if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(config.seed)
 
   # --- Model ---
-  model = Diffusion(config, tokenizer)
-  model = model.to(device)
+  logger.info("Instantiating model on meta device...")
+  with torch.device("meta"):
+    model = Diffusion(config, tokenizer)
 
   tp_mesh = None
   dp_mesh = None
   
-  if config.strategy.name == '3d':
-    # -------------------------------------------------
-    # APPLY TPARALLELISM TO MODEL
-    # -------------------------------------------------
-    world_size = dist.get_world_size()
-    tp_size = config.strategy.tp_degree
-    dp_size = config.strategy.dp_degree
-    if is_main_process():
-        logger.info(f"[TP] World size: {world_size}, TP size: {tp_size}, DP size: {dp_size}, device type {device.type}")
-    mesh_2d = init_device_mesh(device.type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-    tp_mesh = mesh_2d["tp"]
-    dp_mesh = mesh_2d["dp"]
-
-    if is_main_process():
-        print(f"[Debug][3d] Device mesh initialized: {mesh_2d}\n - TP mesh: {tp_mesh}\n - DP mesh: {dp_mesh}")
-    
-    # --- Define TP plan ---
-    tp_plan = {
-        "backbone.vocab_embed.embedding": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False),
-        "backbone.sigma_map.mlp.0": ColwiseParallel(),
-        "backbone.sigma_map.mlp.2": RowwiseParallel(),
-        "backbone.output_layer.adaLN_modulation": ColwiseParallel(input_layouts=Replicate(), use_local_output=False),
-        "backbone.output_layer.norm_final": SequenceParallel(),
-        "backbone.output_layer.linear": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
-    }
-
-    ## --- Looping over DiT Blocks ---
-    n_blocks = len(model.backbone.blocks)
-    for i in range(n_blocks):
-        p = f"backbone.blocks.{i}"
-
-        tp_plan[f"{p}.adaLN_modulation"] = ColwiseParallel(input_layouts=Replicate(), use_local_output=False)
-
-        tp_plan[f"{p}.norm1"] = SequenceParallel()
-
-        tp_plan[f"{p}.atten"] = PrepareModuleInput(
-            input_layouts=(Shard(1),),
-            desired_input_layouts=(Replicate(),),
-        )
-
-        tp_plan[f"{p}.atten.attn_qkv"] = ColwiseParallel(use_local_output=False)
-        tp_plan[f"{p}.atten.attn_out"] = RowwiseParallel(output_layouts=Shard(1), use_local_output=False)
-        
-        tp_plan[f"{p}.norm2"] = SequenceParallel()
-        tp_plan[f"{p}.mlp"] = PrepareModuleInput(
-            input_layouts=(Shard(1),),
-            desired_input_layouts=(Replicate(),),
-        )
-        tp_plan[f"{p}.mlp.w1"] = ColwiseParallel()
-        tp_plan[f"{p}.mlp.w2"] = RowwiseParallel(use_local_output=False)
-
-    parallelize_module(model, tp_mesh, parallelize_plan=tp_plan)
-    if is_main_process():
-        print("[Debug] Tensor Parallelism applied")
-
-    # -------------------------------------------------
-    # APPLY FSDP SHARDING ON TOP OF TP-PARALLELIZED MODEL
-    # -------------------------------------------------
-
-    fsdp_config = {
-        "mesh": dp_mesh,
-        "reshard_after_forward": False,
-    }
-
-    # shard embedding
-    fully_shard(
-        model.backbone.vocab_embed.embedding,
-        **fsdp_config,
-    )
-
-    # shard each transformer block
-    for block in model.backbone.blocks:
-        fully_shard(
-            block,
-            **fsdp_config,
-        )
-
-    # shard output layers
-    fully_shard(
-        [
-            model.backbone.output_layer.norm_final,
-            model.backbone.output_layer.linear,
-        ],
-        **fsdp_config,
-    )
-
-    # final root wrap
-    fully_shard(model.backbone, **fsdp_config)
-
-    torch.cuda.synchronize()
-
-    if is_main_process():
-        print("[Debug][3d] Applied TP + FSDP to model")
-
-    #summarize_param_types(model)
-
-    #debug_topology_and_network(mesh_2d)
-
-    if is_main_process():
-        print(f"[Debug][3d] Model parallelized according to TP plan. Uncomment the debug line at 366 in main_3d.py to see parameter types.")
-
-  else:
-    raise ValueError(f"Not/Unknown distributed strategy {strategy_name} for main_3d.py file type")
   if is_main_process():
-    print(f"Model type after whole setup: {type(model)}")
+    print_model_parameters(model)
+
+  # -----  APPLY DISTRIBUTED STRATEGY -----
+  tp_mesh = None
+  dp_mesh = None
+  model, tp_mesh, dp_mesh = parallelize_model(
+      model=model,
+      config=config,
+      device=device,
+      is_main_process=is_main_process(),
+      logger=logger
+  )
+
+  #model = model.to(device)
+
+  # --- MATERIALIZE SHARDS ON GPU ---
+  logger.info("Materializing sharded model on GPU...")
+  model.to_empty(device=device)
+
+  # --- INITIALIZE WEIGHTS (BD3LM MATH) ---
+  logger.info("Initializing weights with BD3LM scaled-init...")
+  initialize_dit_weights(model)
+  
+  # --- SETUP EMA ---
+  if config.training.ema > 0:
+      logger.info("Initializing EMA for sharded parameters...")
+      model.setup_ema()
 
   # ---- GPU utilization trackers ----
   torch.cuda.reset_peak_memory_stats()
@@ -389,11 +382,9 @@ def _train(config, logger, tokenizer, device, nvml_handle):
   train_sampler = DistributedSampler( train_set, num_replicas=dp_world_size, rank=dp_rank, shuffle=True )
   valid_sampler = DistributedSampler( valid_set, num_replicas=dp_world_size, rank=dp_rank, shuffle=False )
 
-  torch.manual_seed(config.seed)
-
   train_loader = torch.utils.data.DataLoader(
       train_set,
-      batch_size=config.loader.batch_size,
+      batch_size=config.loader.local_batch_size,
       sampler=train_sampler,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
@@ -404,7 +395,7 @@ def _train(config, logger, tokenizer, device, nvml_handle):
 
   valid_loader = torch.utils.data.DataLoader(
     valid_set,
-    batch_size=config.loader.eval_batch_size,
+    batch_size=config.loader.local_eval_batch_size,
     sampler=valid_sampler,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,
@@ -462,7 +453,7 @@ def _train(config, logger, tokenizer, device, nvml_handle):
     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Training]", disable=not is_main_process())
     with profile(
       activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-      schedule=schedule(wait=1, warmup=2, active=3, repeat=1),
+      schedule=schedule(wait=2, warmup=3, active=5, repeat=1),
       on_trace_ready=tensorboard_trace_handler('./profiler_logs/run_2node_tp4_dp2'),
       record_shapes=False,
       profile_memory=True,
@@ -502,7 +493,7 @@ def _train(config, logger, tokenizer, device, nvml_handle):
             loss = loss_obj.loss
           with record_function("backward_pass"):
             loss.backward()
-            clip_grad_norm_hybrid(model.parameters(), 1.0, tp_size=tp_size)
+            clip_grad_norm_hybrid(model.parameters(), 1.0, tp_size=config.strategy.tp_degree)
           if (current_step + 1) % accumulation_steps == 0:
             with record_function("optimizer_step"):
               optimizer.step()

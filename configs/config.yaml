@@ -19,8 +19,8 @@ loader:
   global_batch_size: ${eval:${trainer.devices} * ${trainer.num_nodes}}
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
-  batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  local_batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  local_eval_batch_size: ${.local_batch_size}
   num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
   #num_workers: 32
   pin_memory: True 
@@ -109,3 +109,6 @@ strategy:
   sharding_strategy: FULL_SHARD
   tp_degree: 4
   dp_degree: 1
+  pp_degree: 1
+  microbatches: 1
+  backend: nccl
