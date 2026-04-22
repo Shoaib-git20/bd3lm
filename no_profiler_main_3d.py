@@ -1,9 +1,8 @@
 import sys
-print(sys.executable)
 
 import os
 import time
-import pynvml
+#import pynvml
 import fsspec
 import hydra
 import omegaconf
@@ -11,7 +10,6 @@ import rich.syntax
 import rich.tree
 import math
 import torch
-print(f"PyTorch version: {torch.__version__}")
 import torch.nn as nn
 import transformers
 from tqdm import tqdm
@@ -206,9 +204,9 @@ def set_mpi(): # borrowed from deepspeed
     format(os.environ['RANK'], os.environ['LOCAL_RANK'], os.environ['WORLD_SIZE'], os.environ['MASTER_ADDR'],
             os.environ['MASTER_PORT']))
 
-def setup_distributed():
+def setup_distributed(config):
     """Initializes the distributed process group."""
-    if backend == "mpi":
+    if config.strategy.backend == "mpi":
         set_mpi()
         dist.init_process_group(backend="mpi")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -382,7 +380,7 @@ def module_contains_dtensor(module) -> bool:
             return True
     return False
 
-def _train(config, logger, tokenizer, device, nvml_handle):
+def _train(config, logger, tokenizer, device):
   """Main distributed training loop."""
   rank = int(os.environ["RANK"])
   local_rank = int(os.environ["LOCAL_RANK"])
@@ -552,9 +550,9 @@ def _train(config, logger, tokenizer, device, nvml_handle):
             model.ema.update(model.parameters())
       
         # ---- GPU utilization sampling ----
-        util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
-        max_gpu_util = max(max_gpu_util, util.gpu)
-        max_mem_util = max(max_mem_util, util.memory)
+        #util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+        #max_gpu_util = max(max_gpu_util, util.gpu)
+        #max_mem_util = max(max_mem_util, util.memory)
         iter_end = time.time()
         iter_time = iter_end - iter_start
         tokens_processed = input_ids.numel()*accumulation_steps 
@@ -575,15 +573,14 @@ def _train(config, logger, tokenizer, device, nvml_handle):
           )
           logger.info(
               f"[Rank {dist.get_rank()}] | "
-              f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB | "
-              f"GPU util: {util.gpu}% | Mem util: {util.memory}%"
+              f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB"
           )
       current_step += 1
     if current_step >= max_steps:
       if is_main_process():
         logger.info(f"Reached max_steps ({max_steps}). Stopping training.")
       peak_mem_mb = torch.cuda.max_memory_allocated() / 1024**2
-      logger.info(f"[Rank {dist.get_rank()}] "f"Peak GPU memory allocated: {peak_mem_mb:.2f} MB | "f"Peak GPU util: {max_gpu_util}% | "f"Peak MEM util: {max_mem_util}%")
+      logger.info(f"[Rank {dist.get_rank()}] "f"Peak GPU memory allocated: {peak_mem_mb:.2f} MB")
       break
 
                 #logger.info(f"memory summary:\n{torch.cuda.memory_summary()}")
@@ -635,13 +632,13 @@ def main(config):
   if is_main_process():
       print("Distributed training:", use_distributed)
   if use_distributed:
-      setup_distributed()
+      setup_distributed(config)
   
   torch.cuda.empty_cache()
   # ---- NVML INIT (per process / per rank) ----
-  pynvml.nvmlInit()
+  #pynvml.nvmlInit()
   local_rank = int(os.environ["LOCAL_RANK"])
-  nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+  #nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
 
   logger = utils.get_logger(__name__)
   device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}") if use_distributed else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -651,7 +648,7 @@ def main(config):
       _print_config(config, resolve=True, save_cfg=True)
 
   if config.mode == 'train':
-    _train(config, logger, tokenizer, device, nvml_handle)
+    _train(config, logger, tokenizer, device)
   else:
       if is_main_process():
           logger.warning("sample_eval and ppl_eval modes are not configured yet")
@@ -659,7 +656,7 @@ def main(config):
   if use_distributed:
       cleanup_distributed()
 
-  pynvml.nvmlShutdown()
+  #pynvml.nvmlShutdown()
   torch.cuda.empty_cache()
 
 if __name__ == '__main__':

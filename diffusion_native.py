@@ -98,7 +98,7 @@ class Diffusion(torch.nn.Module):
     if (not hasattr(self.tokenizer, 'mask_token')
         or self.tokenizer.mask_token is None):
       self.mask_index = self.vocab_size
-      self.vocab_size += 1
+      self.vocab_size += 7
     else:
       self.mask_index = self.tokenizer.mask_token_id
 
